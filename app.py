@@ -832,14 +832,15 @@ def get_purchase_orders():
         cur.execute("""
             SELECT po.order_id, po.order_date, po.status, po.total_amount,
                    s.supplier_name, b.branch_name,
-                   creator.full_name, approver.full_name, rr.date_received, po.date_cancelled
+                   creator.full_name, approver.full_name, MAX(rr.date_received), po.date_cancelled
             FROM PURCHASE_ORDERS po
             LEFT JOIN SUPPLIERS s ON po.supplier_id = s.supplier_id
             LEFT JOIN BRANCHES b ON po.branch_id = b.branch_id
             LEFT JOIN USERS creator ON po.created_by_user_id = creator.user_id
             LEFT JOIN USERS approver ON po.approved_by_user_id = approver.user_id
             LEFT JOIN RECEIVING_REPORTS rr ON po.order_id = rr.order_id
-            GROUP BY po.order_id
+            GROUP BY po.order_id, po.order_date, po.status, po.total_amount,
+                     s.supplier_name, b.branch_name, creator.full_name, approver.full_name, po.date_cancelled
             ORDER BY po.order_date DESC
         """)
         rows = cur.fetchall()
