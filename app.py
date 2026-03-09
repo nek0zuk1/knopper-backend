@@ -712,7 +712,104 @@ def get_audit_log(branch_id):
 
 
 # ROUTE: POS - PROCESS SALE 
+@app.route('/pos/checkout', methods=['POST'])
+@jwt_required()
+def process_checkout():
+    current_user_id = get_jwt_identity()
+    claims = get_jwt()
+    current_branch_id = claims['branch']
 
+   
+    if claims.get('role') not in ['admin', 'cashier', 'manager']:
+        return jsonify({"message": "Access Denied."}), 403
+
+    data = request.json
+    cart = data.get('cart') # format: [{"barcode": "4801234567", "quantity": 2}]
+    payment_method = data.get('payment_method', 'CASH')
+    customer_type = data.get('customer_type', 'REGULAR')
+
+    if not cart or not isinstance(cart, list) or len(cart) == 0:
+        return jsonify({"message": "Cart is empty or invalid format."}), 400
+
+    cur = mysql.connection.cursor()
+    try:
+      
+        sale_date = datetime.now()
+        cur.execute("""
+            INSERT INTO SALES_HEADERS (branch_id, user_id, sale_date, total_amount, payment_method, customer_type)
+            VALUES (%s, %s, %s, 0.00, %s, %s)
+        """, (current_branch_id, current_user_id, sale_date, payment_method, customer_type))
+        
+        sale_id = cur.lastrowid
+        grand_total = 0.0
+
+        # PROCESS EACH ITEM IN THE CART
+        for item in cart:
+            scanned_barcode = item.get('barcode') 
+            qty_to_sell = item.get('quantity')
+
+          
+            cur.execute("""
+                SELECT bi.inventory_id, bi.quantity_on_hand, p.price_regular, p.product_id
+                FROM PRODUCT_BARCODES pb
+                JOIN PRODUCTS p ON pb.product_id = p.product_id
+                JOIN BRANCH_INVENTORY bi ON p.product_id = bi.product_id
+                WHERE pb.barcode_value = %s AND bi.branch_id = %s AND bi.quantity_on_hand > 0
+                ORDER BY bi.expiry_date ASC LIMIT 1
+            """, (scanned_barcode, current_branch_id))
+            
+            stock_item = cur.fetchone()
+            if not stock_item:
+                raise Exception(f"Barcode '{scanned_barcode}' is out of stock or not registered in your branch.")
+
+            # Retrieve stock item details
+            inv_id = stock_item[0]
+            current_qty = stock_item[1]
+            price = stock_item[2]
+            prod_id = stock_item[3] 
+            
+            if qty_to_sell > current_qty:
+                raise Exception(f"Insufficient stock for Barcode '{scanned_barcode}'. Only {current_qty} left.")
+
+            # Calculate line total for this specific item
+            line_total = float(price) * qty_to_sell
+            grand_total += line_total
+
+            # Deduct from Branch Inventory
+            new_qty = current_qty - qty_to_sell
+            if new_qty > 0:
+                cur.execute("UPDATE BRANCH_INVENTORY SET quantity_on_hand = %s WHERE inventory_id = %s", (new_qty, inv_id))
+            else:
+                cur.execute("DELETE FROM BRANCH_INVENTORY WHERE inventory_id = %s", (inv_id,))
+
+            # Deduct from Global Total
+            cur.execute("UPDATE PRODUCTS SET total_stock_quantity = total_stock_quantity - %s WHERE product_id = %s", (qty_to_sell, prod_id))
+
+            # Record in SALES_DETAILS (Line Items)
+            cur.execute("""
+                INSERT INTO SALES_DETAILS (sale_id, inventory_id, quantity_sold, price_at_sale, discount_applied)
+                VALUES (%s, %s, %s, %s, 0.00)
+            """, (sale_id, inv_id, qty_to_sell, price))
+
+        # 4. UPDATE THE GRAND TOTAL ON THE HEADER
+        cur.execute("UPDATE SALES_HEADERS SET total_amount = %s WHERE sale_id = %s", (grand_total, sale_id))
+
+        mysql.connection.commit()
+        
+        # Output showing the total price prominently
+        return jsonify({
+            "status": "success",
+            "message": "Checkout complete!",
+            "receipt_number": sale_id,
+            "items_purchased": len(cart),
+            "total_price": round(grand_total, 2)
+        }), 201
+
+    except Exception as e:
+        mysql.connection.rollback()
+        return jsonify({"error": str(e)}), 400
+    finally:
+        cur.close()
 
 
 
@@ -723,12 +820,68 @@ def get_audit_log(branch_id):
 
 
 #----- procurement routes ---------------------------------
-
 def next_id(cursor, table, id_col):
     """Auto-generate the next ID for any table."""
     cursor.execute(f"SELECT IFNULL(MAX({id_col}), 0) + 1 FROM {table}")
     return cursor.fetchone()[0]
 
+# GET /procurement/<id> - Get PO details with items
+@app.route('/procurement/<int:order_id>', methods=['GET'])
+@jwt_required()
+def get_purchase_order(order_id):
+    claims = get_jwt()
+    if claims['role'] not in ['admin', 'manager']:
+        return jsonify({'message': 'Access Denied'}), 403
+    cur = mysql.connection.cursor()
+    try:
+        # Get PO Header
+        cur.execute("""
+            SELECT po.order_id, po.order_date, po.status, po.total_amount,
+                   s.supplier_name, b.branch_name,
+                   creator.full_name, approver.full_name
+            FROM PURCHASE_ORDERS po
+            LEFT JOIN SUPPLIERS s ON po.supplier_id = s.supplier_id
+            LEFT JOIN BRANCHES b ON po.branch_id = b.branch_id
+            LEFT JOIN USERS creator ON po.created_by_user_id = creator.user_id
+            LEFT JOIN USERS approver ON po.approved_by_user_id = approver.user_id
+            WHERE po.order_id = %s
+        """, (order_id,))
+        po = cur.fetchone()
+        if not po:
+            return jsonify({'message': 'PO not found'}), 404
+
+        # Get PO Items
+        cur.execute("""
+            SELECT poi.po_item_id, p.product_name_official, 
+                   poi.quantity_ordered, poi.uom, poi.cost_at_time_of_order, poi.item_status
+            FROM PURCHASE_ORDER_ITEMS poi
+            JOIN PRODUCTS p ON poi.product_id = p.product_id
+            WHERE poi.order_id = %s
+        """, (order_id,))
+        items = cur.fetchall()
+
+        return jsonify({
+            'order_id': po[0],
+            'order_date': po[1].strftime('%Y-%m-%d') if po[1] else None,
+            'status': po[2],
+            'total_amount': float(po[3]) if po[3] else 0.00,
+            'supplier': po[4],
+            'branch': po[5],
+            'created_by': po[6],
+            'approved_by': po[7],
+            'items': [{
+                'po_item_id': i[0],
+                'product': i[1],
+                'quantity': i[2],
+                'uom': i[3],
+                'cost': float(i[4]) if i[4] else 0.00,
+                'status': i[5]
+            } for i in items]
+        }), 200
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+    finally:
+        cur.close()
 
 # GET /purchase-orders
 @app.route('/procurement', methods=['GET'])
@@ -741,11 +894,13 @@ def get_purchase_orders():
     try:
         cur.execute("""
             SELECT po.order_id, po.order_date, po.status, po.total_amount,
-                   s.supplier_name, b.branch_name, creator.full_name
+                   s.supplier_name, b.branch_name,
+                   creator.full_name, approver.full_name
             FROM PURCHASE_ORDERS po
             LEFT JOIN SUPPLIERS s ON po.supplier_id = s.supplier_id
             LEFT JOIN BRANCHES b ON po.branch_id = b.branch_id
             LEFT JOIN USERS creator ON po.created_by_user_id = creator.user_id
+            LEFT JOIN USERS approver ON po.approved_by_user_id = approver.user_id
             ORDER BY po.order_date DESC
         """)
         rows = cur.fetchall()
@@ -756,7 +911,8 @@ def get_purchase_orders():
             "total_amount": float(r[3]) if r[3] else 0.00,
             "supplier": r[4],
             "branch": r[5],
-            "created_by": r[6]
+            "created_by": r[6],
+            "approved_by": r[7]
         } for r in rows]), 200
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -819,11 +975,8 @@ def update_purchase_order(order_id):
         return jsonify({"message": "Need: status (DRAFT / SENT / RECEIVED / CANCELLED)"}), 400
     cur = mysql.connection.cursor()
     try:
-        if new_status in ['SENT', 'RECEIVED']:
-            cur.execute("UPDATE PURCHASE_ORDERS SET status=%s, approved_by_user_id=%s WHERE order_id=%s",
-                        (new_status, current_user_id, order_id))
-        else:
-            cur.execute("UPDATE PURCHASE_ORDERS SET status=%s WHERE order_id=%s", (new_status, order_id))
+        cur.execute("UPDATE PURCHASE_ORDERS SET status=%s, approved_by_user_id=%s WHERE order_id=%s",
+                    (new_status, current_user_id, order_id))
         if cur.rowcount == 0:
             return jsonify({"message": "PO not found"}), 404
         mysql.connection.commit()
@@ -922,10 +1075,6 @@ def create_transfer():
         return jsonify({"error": str(e)}), 500
     finally:
         cur.close()
-
-
-
-
 
 
 
