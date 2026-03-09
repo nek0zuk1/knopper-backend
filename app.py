@@ -127,6 +127,35 @@ def login():
     
     return jsonify({"message": "Invalid Credentials"}), 401
 
+# show branch info
+@app.route('/branch/<int:branch_id>', methods=['GET'])
+@jwt_required()
+def get_branch_info(branch_id):
+    cur = mysql.connection.cursor()
+    try:
+        cur.execute("""
+            SELECT branch_name, branch_code 
+            FROM BRANCHES 
+            WHERE branch_id = %s
+        """, (branch_id,))
+        
+        branch = cur.fetchone()
+        
+        if not branch:
+            return jsonify({"message": f"Branch ID {branch_id} not found."}), 404
+            
+        return jsonify({
+            "status": "success",
+            "branch_id": branch_id,
+            "branch_name": branch[0],
+            "branch_code": branch[1]
+        }), 200
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+    finally:
+        cur.close()
+
 #  SETUP ADMIN 
 @app.route('/setup-admin', methods=['POST'])
 def setup_admin():
