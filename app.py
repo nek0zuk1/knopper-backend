@@ -832,13 +832,14 @@ def get_purchase_orders():
         cur.execute("""
             SELECT po.order_id, po.order_date, po.status, po.total_amount,
                    s.supplier_name, b.branch_name,
-                   creator.full_name, approver.full_name, rr.date_received
+                   creator.full_name, approver.full_name, rr.date_received, po.date_cancelled
             FROM PURCHASE_ORDERS po
             LEFT JOIN SUPPLIERS s ON po.supplier_id = s.supplier_id
             LEFT JOIN BRANCHES b ON po.branch_id = b.branch_id
             LEFT JOIN USERS creator ON po.created_by_user_id = creator.user_id
             LEFT JOIN USERS approver ON po.approved_by_user_id = approver.user_id
             LEFT JOIN RECEIVING_REPORTS rr ON po.order_id = rr.order_id
+            GROUP BY po.order_id
             ORDER BY po.order_date DESC
         """)
         rows = cur.fetchall()
@@ -851,7 +852,8 @@ def get_purchase_orders():
             "branch": r[5],
             "created_by": r[6],
             "approved_by": r[7],
-            "date_received": r[8].strftime('%Y-%m-%d %H:%M') if r[8] else None
+            "date_received": r[8].strftime('%Y-%m-%d %H:%M') if r[8] else None,
+            "date_cancelled": r[9].strftime('%Y-%m-%d %H:%M') if r[9] else None
         } for r in rows]), 200
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -920,6 +922,7 @@ def get_purchase_order(order_id):
         return jsonify({'error': str(e)}), 500
     finally:
         cur.close()
+
 # POST /purchase-orders
 # Send: supplier_id, branch_id, items[{product_id, quantity, cost}]
 @app.route('/procurement', methods=['POST'])
@@ -1007,6 +1010,16 @@ def receive_delivery():
         return jsonify({"message": "Need: order_id"}), 400
     cur = mysql.connection.cursor()
     try:
+        # Check PO status first
+        cur.execute("SELECT status FROM PURCHASE_ORDERS WHERE order_id=%s", (order_id,))
+        po = cur.fetchone()
+        if not po:
+            return jsonify({"message": "PO not found"}), 404
+        if po[0] == 'CANCELLED':
+            return jsonify({"message": "Cannot receive a CANCELLED PO!"}), 400
+        if po[0] == 'RECEIVED':
+            return jsonify({"message": "This PO has already been received!"}), 400
+
         # Auto-fetch all items from the PO
         cur.execute("SELECT po_item_id, quantity_ordered FROM PURCHASE_ORDER_ITEMS WHERE order_id=%s", (order_id,))
         items = cur.fetchall()
