@@ -711,6 +711,15 @@ def get_audit_log(branch_id):
 # ----------------------------------POS----------------------
 
 
+# ROUTE: POS - PROCESS SALE 
+
+
+
+
+
+
+
+
 
 
 #----- procurement routes ---------------------------------
@@ -732,13 +741,11 @@ def get_purchase_orders():
     try:
         cur.execute("""
             SELECT po.order_id, po.order_date, po.status, po.total_amount,
-                   s.supplier_name, b.branch_name,
-                   creator.full_name, approver.full_name
+                   s.supplier_name, b.branch_name, creator.full_name
             FROM PURCHASE_ORDERS po
             LEFT JOIN SUPPLIERS s ON po.supplier_id = s.supplier_id
             LEFT JOIN BRANCHES b ON po.branch_id = b.branch_id
             LEFT JOIN USERS creator ON po.created_by_user_id = creator.user_id
-            LEFT JOIN USERS approver ON po.approved_by_user_id = approver.user_id
             ORDER BY po.order_date DESC
         """)
         rows = cur.fetchall()
@@ -749,8 +756,7 @@ def get_purchase_orders():
             "total_amount": float(r[3]) if r[3] else 0.00,
             "supplier": r[4],
             "branch": r[5],
-            "created_by": r[6],
-            "approved_by": r[7]
+            "created_by": r[6]
         } for r in rows]), 200
     except Exception as e:
         return jsonify({"error": str(e)}), 500
