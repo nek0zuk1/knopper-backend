@@ -656,7 +656,6 @@ def get_near_expiry():
 
 # route for admmin monitoring -----------------
 # VIEW STOCK AUDIT LOG
-
 @app.route('/admin/audit-log/<int:branch_id>', methods=['GET'])
 @jwt_required()
 def get_audit_log(branch_id):
@@ -705,7 +704,225 @@ def get_audit_log(branch_id):
     except Exception as e:
         return jsonify({"error": str(e)}), 500
     finally:
+        cur.close
+
+
+
+# ----------------------------------POS----------------------
+
+
+
+
+#----- procurement routes ---------------------------------
+
+def next_id(cursor, table, id_col):
+    """Auto-generate the next ID for any table."""
+    cursor.execute(f"SELECT IFNULL(MAX({id_col}), 0) + 1 FROM {table}")
+    return cursor.fetchone()[0]
+
+
+# GET /purchase-orders
+@app.route('/procurement', methods=['GET'])
+@jwt_required()
+def get_purchase_orders():
+    claims = get_jwt()
+    if claims['role'] not in ['admin', 'manager']:
+        return jsonify({"message": "Access Denied"}), 403
+    cur = mysql.connection.cursor()
+    try:
+        cur.execute("""
+            SELECT po.order_id, po.order_date, po.status, po.total_amount,
+                   s.supplier_name, b.branch_name,
+                   creator.full_name, approver.full_name
+            FROM PURCHASE_ORDERS po
+            LEFT JOIN SUPPLIERS s ON po.supplier_id = s.supplier_id
+            LEFT JOIN BRANCHES b ON po.branch_id = b.branch_id
+            LEFT JOIN USERS creator ON po.created_by_user_id = creator.user_id
+            LEFT JOIN USERS approver ON po.approved_by_user_id = approver.user_id
+            ORDER BY po.order_date DESC
+        """)
+        rows = cur.fetchall()
+        return jsonify([{
+            "order_id": r[0],
+            "order_date": r[1].strftime('%Y-%m-%d') if r[1] else None,
+            "status": r[2],
+            "total_amount": float(r[3]) if r[3] else 0.00,
+            "supplier": r[4],
+            "branch": r[5],
+            "created_by": r[6],
+            "approved_by": r[7]
+        } for r in rows]), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+    finally:
         cur.close()
+
+
+# POST /purchase-orders
+# Send: supplier_id, branch_id, items[{product_id, quantity, cost}]
+@app.route('/procurement', methods=['POST'])
+@jwt_required()
+def create_purchase_order():
+    claims = get_jwt()
+    current_user_id = int(get_jwt_identity())
+    if claims['role'] not in ['admin', 'manager']:
+        return jsonify({"message": "Access Denied"}), 403
+    data = request.json
+    supplier_id = data.get('supplier_id')
+    branch_id   = data.get('branch_id')
+    items       = data.get('items', [])
+    if not all([supplier_id, branch_id, items]):
+        return jsonify({"message": "Need: supplier_id, branch_id, items"}), 400
+    cur = mysql.connection.cursor()
+    try:
+        order_id = next_id(cur, 'PURCHASE_ORDERS', 'order_id')
+        total    = sum(float(i.get('cost', 0)) * int(i.get('quantity', 0)) for i in items)
+        cur.execute("""
+            INSERT INTO PURCHASE_ORDERS
+            (order_id, supplier_id, branch_id, created_by_user_id, order_date, status, total_amount)
+            VALUES (%s, %s, %s, %s, NOW(), 'DRAFT', %s)
+        """, (order_id, supplier_id, branch_id, current_user_id, total))
+        for item in items:
+            po_item_id = next_id(cur, 'PURCHASE_ORDER_ITEMS', 'po_item_id')
+            cur.execute("""
+                INSERT INTO PURCHASE_ORDER_ITEMS
+                (po_item_id, order_id, product_id, quantity_ordered, uom, conversion_factor, cost_at_time_of_order, item_status)
+                VALUES (%s, %s, %s, %s, 'PC', 1, %s, 'PENDING')
+            """, (po_item_id, order_id, item.get('product_id'), item.get('quantity'), item.get('cost', 0)))
+        mysql.connection.commit()
+        return jsonify({"message": "PO created!", "order_id": order_id, "total": total}), 201
+    except Exception as e:
+        mysql.connection.rollback()
+        return jsonify({"error": str(e)}), 500
+    finally:
+        cur.close()
+
+
+# PUT /purchase-orders/<id>
+# Send: status
+@app.route('/procurement/<int:order_id>', methods=['PUT'])
+@jwt_required()
+def update_purchase_order(order_id):
+    claims = get_jwt()
+    current_user_id = int(get_jwt_identity())
+    if claims['role'] not in ['admin', 'manager']:
+        return jsonify({"message": "Access Denied"}), 403
+    data       = request.json
+    new_status = data.get('status')
+    if not new_status:
+        return jsonify({"message": "Need: status (DRAFT / SENT / RECEIVED / CANCELLED)"}), 400
+    cur = mysql.connection.cursor()
+    try:
+        if new_status in ['SENT', 'RECEIVED']:
+            cur.execute("UPDATE PURCHASE_ORDERS SET status=%s, approved_by_user_id=%s WHERE order_id=%s",
+                        (new_status, current_user_id, order_id))
+        else:
+            cur.execute("UPDATE PURCHASE_ORDERS SET status=%s WHERE order_id=%s", (new_status, order_id))
+        if cur.rowcount == 0:
+            return jsonify({"message": "PO not found"}), 404
+        mysql.connection.commit()
+        return jsonify({"message": f"PO {order_id} is now '{new_status}'"}), 200
+    except Exception as e:
+        mysql.connection.rollback()
+        return jsonify({"error": str(e)}), 500
+    finally:
+        cur.close()
+
+
+# POST /receiving
+# Send: order_id, items[{po_item_id, quantity, batch, expiry}]
+@app.route('/procurement/receive', methods=['POST'])
+@jwt_required()
+def receive_delivery():
+    claims = get_jwt()
+    current_user_id = int(get_jwt_identity())
+    if claims['role'] not in ['admin', 'manager']:
+        return jsonify({"message": "Access Denied"}), 403
+    data     = request.json
+    order_id = data.get('order_id')
+    items    = data.get('items', [])
+    if not all([order_id, items]):
+        return jsonify({"message": "Need: order_id, items"}), 400
+    cur = mysql.connection.cursor()
+    try:
+        receipt_id = next_id(cur, 'RECEIVING_REPORTS', 'receipt_id')
+        cur.execute("""
+            INSERT INTO RECEIVING_REPORTS
+            (receipt_id, order_id, received_by_user_id, date_received)
+            VALUES (%s, %s, %s, NOW())
+        """, (receipt_id, order_id, current_user_id))
+        for item in items:
+            receipt_item_id = next_id(cur, 'RECEIPT_ITEMS', 'receipt_item_id')
+            cur.execute("""
+                INSERT INTO RECEIPT_ITEMS
+                (receipt_item_id, receipt_id, po_item_id, quantity_received, batch_number, expiry_date)
+                VALUES (%s, %s, %s, %s, %s, %s)
+            """, (receipt_item_id, receipt_id, item.get('po_item_id'),
+                  item.get('quantity'), item.get('batch', 'BATCH-001'), item.get('expiry')))
+            cur.execute("UPDATE PURCHASE_ORDER_ITEMS SET item_status='RECEIVED' WHERE po_item_id=%s",
+                        (item.get('po_item_id'),))
+        cur.execute("UPDATE PURCHASE_ORDERS SET status='RECEIVED' WHERE order_id=%s", (order_id,))
+        mysql.connection.commit()
+        return jsonify({"message": f"Delivery recorded for PO {order_id}!"}), 201
+    except Exception as e:
+        mysql.connection.rollback()
+        return jsonify({"error": str(e)}), 500
+    finally:
+        cur.close()
+
+
+# POST /transfers
+# Send: from_branch_id, to_branch_id, items[{product_id, quantity, batch}]
+@app.route('/procurement/transfer', methods=['POST'])
+@jwt_required()
+def create_transfer():
+    claims = get_jwt()
+    current_user_id = int(get_jwt_identity())
+    if claims['role'] not in ['admin', 'manager']:
+        return jsonify({"message": "Access Denied"}), 403
+    data        = request.json
+    from_branch = data.get('from_branch_id')
+    to_branch   = data.get('to_branch_id')
+    items       = data.get('items', [])
+    if not all([from_branch, to_branch, items]):
+        return jsonify({"message": "Need: from_branch_id, to_branch_id, items"}), 400
+    if from_branch == to_branch:
+        return jsonify({"message": "Cannot transfer to the same branch!"}), 400
+    cur = mysql.connection.cursor()
+    try:
+        manifest_id = next_id(cur, 'TRANSFER_MANIFEST', 'manifest_id')
+        cur.execute("""
+            INSERT INTO TRANSFER_MANIFEST
+            (manifest_id, user_id, from_branch_id, to_branch_id, date_departed, status)
+            VALUES (%s, %s, %s, %s, NOW(), 'IN_TRANSIT')
+        """, (manifest_id, current_user_id, from_branch, to_branch))
+        for item in items:
+            transfer_item_id = next_id(cur, 'TRANSFER_ITEMS', 'transfer_item_id')
+            batch = item.get('batch', 'BATCH-001')
+            cur.execute("""
+                INSERT INTO TRANSFER_ITEMS
+                (transfer_item_id, manifest_id, product_id, batch_number, quantity_sent, quantity_received)
+                VALUES (%s, %s, %s, %s, %s, 0)
+            """, (transfer_item_id, manifest_id, item.get('product_id'), batch, item.get('quantity')))
+            cur.execute("""
+                UPDATE BRANCH_INVENTORY
+                SET quantity_on_hand = quantity_on_hand - %s
+                WHERE product_id=%s AND branch_id=%s AND batch_number=%s
+            """, (item.get('quantity'), item.get('product_id'), from_branch, batch))
+        mysql.connection.commit()
+        return jsonify({"message": "Transfer created!", "manifest_id": manifest_id}), 201
+    except Exception as e:
+        mysql.connection.rollback()
+        return jsonify({"error": str(e)}), 500
+    finally:
+        cur.close()
+
+
+
+
+
+
+
 
 if __name__ == '__main__':
     app.run(debug=True)
