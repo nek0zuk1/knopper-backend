@@ -842,16 +842,55 @@ def process_checkout():
 
 
 
-
-
-
-
-
-#----- procurement routes ---------------------------------
+#-------------------Procurement/Stock Management-------------------#
 def next_id(cursor, table, id_col):
     """Auto-generate the next ID for any table."""
     cursor.execute(f"SELECT IFNULL(MAX({id_col}), 0) + 1 FROM {table}")
     return cursor.fetchone()[0]
+
+
+# GET /purchase-orders
+@app.route('/procurement', methods=['GET'])
+@jwt_required()
+def get_purchase_orders():
+    claims = get_jwt()
+    if claims['role'] not in ['admin', 'manager']:
+        return jsonify({"message": "Access Denied"}), 403
+    cur = mysql.connection.cursor()
+    try:
+        cur.execute("""
+            SELECT po.order_id, po.order_date, po.status, po.total_amount,
+                   s.supplier_name, b.branch_name,
+                   creator.full_name, approver.full_name, MAX(rr.date_received), po.date_cancelled
+            FROM PURCHASE_ORDERS po
+            LEFT JOIN SUPPLIERS s ON po.supplier_id = s.supplier_id
+            LEFT JOIN BRANCHES b ON po.branch_id = b.branch_id
+            LEFT JOIN USERS creator ON po.created_by_user_id = creator.user_id
+            LEFT JOIN USERS approver ON po.approved_by_user_id = approver.user_id
+            LEFT JOIN RECEIVING_REPORTS rr ON po.order_id = rr.order_id
+            GROUP BY po.order_id, po.order_date, po.status, po.total_amount,
+                     s.supplier_name, b.branch_name, creator.full_name, approver.full_name, po.date_cancelled
+            ORDER BY po.order_date DESC
+        """)
+        rows = cur.fetchall()
+        return jsonify([{
+            "order_id": r[0],
+            "order_date": r[1].strftime('%Y-%m-%d') if r[1] else None,
+            "status": r[2],
+            "total_amount": float(r[3]) if r[3] else 0.00,
+            "supplier": r[4],
+            "branch": r[5],
+            "created_by": r[6],
+            "approved_by": r[7],
+            "date_received": r[8].strftime('%Y-%m-%d %H:%M') if r[8] else None,
+            "date_cancelled": r[9].strftime('%Y-%m-%d %H:%M') if r[9] else None
+        } for r in rows]), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+    finally:
+        cur.close()
+
+
 
 # GET /procurement/<id> - Get PO details with items
 @app.route('/procurement/<int:order_id>', methods=['GET'])
@@ -866,12 +905,13 @@ def get_purchase_order(order_id):
         cur.execute("""
             SELECT po.order_id, po.order_date, po.status, po.total_amount,
                    s.supplier_name, b.branch_name,
-                   creator.full_name, approver.full_name
+                   creator.full_name, approver.full_name, rr.date_received, po.date_cancelled
             FROM PURCHASE_ORDERS po
             LEFT JOIN SUPPLIERS s ON po.supplier_id = s.supplier_id
             LEFT JOIN BRANCHES b ON po.branch_id = b.branch_id
             LEFT JOIN USERS creator ON po.created_by_user_id = creator.user_id
             LEFT JOIN USERS approver ON po.approved_by_user_id = approver.user_id
+            LEFT JOIN RECEIVING_REPORTS rr ON po.order_id = rr.order_id
             WHERE po.order_id = %s
         """, (order_id,))
         po = cur.fetchone()
@@ -897,6 +937,8 @@ def get_purchase_order(order_id):
             'branch': po[5],
             'created_by': po[6],
             'approved_by': po[7],
+            'date_received': po[8].strftime('%Y-%m-%d %H:%M') if po[8] else None,
+            'date_cancelled': po[9].strftime('%Y-%m-%d %H:%M') if po[9] else None,
             'items': [{
                 'po_item_id': i[0],
                 'product': i[1],
@@ -910,43 +952,6 @@ def get_purchase_order(order_id):
         return jsonify({'error': str(e)}), 500
     finally:
         cur.close()
-
-# GET /purchase-orders
-@app.route('/procurement', methods=['GET'])
-@jwt_required()
-def get_purchase_orders():
-    claims = get_jwt()
-    if claims['role'] not in ['admin', 'manager']:
-        return jsonify({"message": "Access Denied"}), 403
-    cur = mysql.connection.cursor()
-    try:
-        cur.execute("""
-            SELECT po.order_id, po.order_date, po.status, po.total_amount,
-                   s.supplier_name, b.branch_name,
-                   creator.full_name, approver.full_name
-            FROM PURCHASE_ORDERS po
-            LEFT JOIN SUPPLIERS s ON po.supplier_id = s.supplier_id
-            LEFT JOIN BRANCHES b ON po.branch_id = b.branch_id
-            LEFT JOIN USERS creator ON po.created_by_user_id = creator.user_id
-            LEFT JOIN USERS approver ON po.approved_by_user_id = approver.user_id
-            ORDER BY po.order_date DESC
-        """)
-        rows = cur.fetchall()
-        return jsonify([{
-            "order_id": r[0],
-            "order_date": r[1].strftime('%Y-%m-%d') if r[1] else None,
-            "status": r[2],
-            "total_amount": float(r[3]) if r[3] else 0.00,
-            "supplier": r[4],
-            "branch": r[5],
-            "created_by": r[6],
-            "approved_by": r[7]
-        } for r in rows]), 200
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-    finally:
-        cur.close()
-
 
 # POST /purchase-orders
 # Send: supplier_id, branch_id, items[{product_id, quantity, cost}]
@@ -969,9 +974,9 @@ def create_purchase_order():
         total    = sum(float(i.get('cost', 0)) * int(i.get('quantity', 0)) for i in items)
         cur.execute("""
             INSERT INTO PURCHASE_ORDERS
-            (order_id, supplier_id, branch_id, created_by_user_id, order_date, status, total_amount)
-            VALUES (%s, %s, %s, %s, NOW(), 'DRAFT', %s)
-        """, (order_id, supplier_id, branch_id, current_user_id, total))
+            (order_id, supplier_id, branch_id, created_by_user_id, approved_by_user_id, order_date, status, total_amount)
+            VALUES (%s, %s, %s, %s, %s, NOW(), 'DRAFT', %s)
+        """, (order_id, supplier_id, branch_id, current_user_id, current_user_id, total))
         for item in items:
             po_item_id = next_id(cur, 'PURCHASE_ORDER_ITEMS', 'po_item_id')
             cur.execute("""
@@ -1000,11 +1005,15 @@ def update_purchase_order(order_id):
     data       = request.json
     new_status = data.get('status')
     if not new_status:
-        return jsonify({"message": "Need: status (DRAFT / SENT / RECEIVED / CANCELLED)"}), 400
+        return jsonify({"message": "Need: status (DRAFT / APPROVED / SENT / RECEIVED / CANCELLED)"}), 400
     cur = mysql.connection.cursor()
     try:
-        cur.execute("UPDATE PURCHASE_ORDERS SET status=%s, approved_by_user_id=%s WHERE order_id=%s",
-                    (new_status, current_user_id, order_id))
+        if new_status == 'CANCELLED':
+            cur.execute("UPDATE PURCHASE_ORDERS SET status=%s, approved_by_user_id=%s, date_cancelled=NOW() WHERE order_id=%s",
+                        (new_status, current_user_id, order_id))
+        else:
+            cur.execute("UPDATE PURCHASE_ORDERS SET status=%s, approved_by_user_id=%s WHERE order_id=%s",
+                        (new_status, current_user_id, order_id))
         if cur.rowcount == 0:
             return jsonify({"message": "PO not found"}), 404
         mysql.connection.commit()
@@ -1027,11 +1036,26 @@ def receive_delivery():
         return jsonify({"message": "Access Denied"}), 403
     data     = request.json
     order_id = data.get('order_id')
-    items    = data.get('items', [])
-    if not all([order_id, items]):
-        return jsonify({"message": "Need: order_id, items"}), 400
+    if not order_id:
+        return jsonify({"message": "Need: order_id"}), 400
     cur = mysql.connection.cursor()
     try:
+        # Check PO status first
+        cur.execute("SELECT status FROM PURCHASE_ORDERS WHERE order_id=%s", (order_id,))
+        po = cur.fetchone()
+        if not po:
+            return jsonify({"message": "PO not found"}), 404
+        if po[0] == 'CANCELLED':
+            return jsonify({"message": "Cannot receive a CANCELLED PO!"}), 400
+        if po[0] == 'RECEIVED':
+            return jsonify({"message": "This PO has already been received!"}), 400
+
+        # Auto-fetch all items from the PO
+        cur.execute("SELECT po_item_id, quantity_ordered FROM PURCHASE_ORDER_ITEMS WHERE order_id=%s", (order_id,))
+        items = cur.fetchall()
+        if not items:
+            return jsonify({"message": "No items found for this PO"}), 404
+
         receipt_id = next_id(cur, 'RECEIVING_REPORTS', 'receipt_id')
         cur.execute("""
             INSERT INTO RECEIVING_REPORTS
@@ -1043,11 +1067,9 @@ def receive_delivery():
             cur.execute("""
                 INSERT INTO RECEIPT_ITEMS
                 (receipt_item_id, receipt_id, po_item_id, quantity_received, batch_number, expiry_date)
-                VALUES (%s, %s, %s, %s, %s, %s)
-            """, (receipt_item_id, receipt_id, item.get('po_item_id'),
-                  item.get('quantity'), item.get('batch', 'BATCH-001'), item.get('expiry')))
-            cur.execute("UPDATE PURCHASE_ORDER_ITEMS SET item_status='RECEIVED' WHERE po_item_id=%s",
-                        (item.get('po_item_id'),))
+                VALUES (%s, %s, %s, %s, 'BATCH-001', NULL)
+            """, (receipt_item_id, receipt_id, item[0], item[1]))
+            cur.execute("UPDATE PURCHASE_ORDER_ITEMS SET item_status='RECEIVED' WHERE po_item_id=%s", (item[0],))
         cur.execute("UPDATE PURCHASE_ORDERS SET status='RECEIVED' WHERE order_id=%s", (order_id,))
         mysql.connection.commit()
         return jsonify({"message": f"Delivery recorded for PO {order_id}!"}), 201
@@ -1103,7 +1125,6 @@ def create_transfer():
         return jsonify({"error": str(e)}), 500
     finally:
         cur.close()
-
 
 
 
