@@ -819,6 +819,47 @@ def next_id(cursor, table, id_col):
     cursor.execute(f"SELECT IFNULL(MAX({id_col}), 0) + 1 FROM {table}")
     return cursor.fetchone()[0]
 
+
+# GET /purchase-orders
+@app.route('/procurement', methods=['GET'])
+@jwt_required()
+def get_purchase_orders():
+    claims = get_jwt()
+    if claims['role'] not in ['admin', 'manager']:
+        return jsonify({"message": "Access Denied"}), 403
+    cur = mysql.connection.cursor()
+    try:
+        cur.execute("""
+            SELECT po.order_id, po.order_date, po.status, po.total_amount,
+                   s.supplier_name, b.branch_name,
+                   creator.full_name, approver.full_name, rr.date_received
+            FROM PURCHASE_ORDERS po
+            LEFT JOIN SUPPLIERS s ON po.supplier_id = s.supplier_id
+            LEFT JOIN BRANCHES b ON po.branch_id = b.branch_id
+            LEFT JOIN USERS creator ON po.created_by_user_id = creator.user_id
+            LEFT JOIN USERS approver ON po.approved_by_user_id = approver.user_id
+            LEFT JOIN RECEIVING_REPORTS rr ON po.order_id = rr.order_id
+            ORDER BY po.order_date DESC
+        """)
+        rows = cur.fetchall()
+        return jsonify([{
+            "order_id": r[0],
+            "order_date": r[1].strftime('%Y-%m-%d') if r[1] else None,
+            "status": r[2],
+            "total_amount": float(r[3]) if r[3] else 0.00,
+            "supplier": r[4],
+            "branch": r[5],
+            "created_by": r[6],
+            "approved_by": r[7],
+            "date_received": r[8].strftime('%Y-%m-%d %H:%M') if r[8] else None
+        } for r in rows]), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+    finally:
+        cur.close()
+
+
+
 # GET /procurement/<id> - Get PO details with items
 @app.route('/procurement/<int:order_id>', methods=['GET'])
 @jwt_required()
@@ -832,12 +873,13 @@ def get_purchase_order(order_id):
         cur.execute("""
             SELECT po.order_id, po.order_date, po.status, po.total_amount,
                    s.supplier_name, b.branch_name,
-                   creator.full_name, approver.full_name
+                   creator.full_name, approver.full_name, rr.date_received
             FROM PURCHASE_ORDERS po
             LEFT JOIN SUPPLIERS s ON po.supplier_id = s.supplier_id
             LEFT JOIN BRANCHES b ON po.branch_id = b.branch_id
             LEFT JOIN USERS creator ON po.created_by_user_id = creator.user_id
             LEFT JOIN USERS approver ON po.approved_by_user_id = approver.user_id
+            LEFT JOIN RECEIVING_REPORTS rr ON po.order_id = rr.order_id
             WHERE po.order_id = %s
         """, (order_id,))
         po = cur.fetchone()
@@ -863,6 +905,7 @@ def get_purchase_order(order_id):
             'branch': po[5],
             'created_by': po[6],
             'approved_by': po[7],
+            'date_received': po[8].strftime('%Y-%m-%d %H:%M') if po[8] else None,
             'items': [{
                 'po_item_id': i[0],
                 'product': i[1],
@@ -876,43 +919,6 @@ def get_purchase_order(order_id):
         return jsonify({'error': str(e)}), 500
     finally:
         cur.close()
-
-# GET /purchase-orders
-@app.route('/procurement', methods=['GET'])
-@jwt_required()
-def get_purchase_orders():
-    claims = get_jwt()
-    if claims['role'] not in ['admin', 'manager']:
-        return jsonify({"message": "Access Denied"}), 403
-    cur = mysql.connection.cursor()
-    try:
-        cur.execute("""
-            SELECT po.order_id, po.order_date, po.status, po.total_amount,
-                   s.supplier_name, b.branch_name,
-                   creator.full_name, approver.full_name
-            FROM PURCHASE_ORDERS po
-            LEFT JOIN SUPPLIERS s ON po.supplier_id = s.supplier_id
-            LEFT JOIN BRANCHES b ON po.branch_id = b.branch_id
-            LEFT JOIN USERS creator ON po.created_by_user_id = creator.user_id
-            LEFT JOIN USERS approver ON po.approved_by_user_id = approver.user_id
-            ORDER BY po.order_date DESC
-        """)
-        rows = cur.fetchall()
-        return jsonify([{
-            "order_id": r[0],
-            "order_date": r[1].strftime('%Y-%m-%d') if r[1] else None,
-            "status": r[2],
-            "total_amount": float(r[3]) if r[3] else 0.00,
-            "supplier": r[4],
-            "branch": r[5],
-            "created_by": r[6],
-            "approved_by": r[7]
-        } for r in rows]), 200
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-    finally:
-        cur.close()
-
 
 # POST /purchase-orders
 # Send: supplier_id, branch_id, items[{product_id, quantity, cost}]
@@ -935,9 +941,9 @@ def create_purchase_order():
         total    = sum(float(i.get('cost', 0)) * int(i.get('quantity', 0)) for i in items)
         cur.execute("""
             INSERT INTO PURCHASE_ORDERS
-            (order_id, supplier_id, branch_id, created_by_user_id, order_date, status, total_amount)
-            VALUES (%s, %s, %s, %s, NOW(), 'DRAFT', %s)
-        """, (order_id, supplier_id, branch_id, current_user_id, total))
+            (order_id, supplier_id, branch_id, created_by_user_id, approved_by_user_id, order_date, status, total_amount)
+            VALUES (%s, %s, %s, %s, %s, NOW(), 'DRAFT', %s)
+        """, (order_id, supplier_id, branch_id, current_user_id, current_user_id, total))
         for item in items:
             po_item_id = next_id(cur, 'PURCHASE_ORDER_ITEMS', 'po_item_id')
             cur.execute("""
@@ -966,7 +972,7 @@ def update_purchase_order(order_id):
     data       = request.json
     new_status = data.get('status')
     if not new_status:
-        return jsonify({"message": "Need: status (DRAFT / SENT / RECEIVED / CANCELLED)"}), 400
+        return jsonify({"message": "Need: status (DRAFT / APPROVED / SENT / RECEIVED / CANCELLED)"}), 400
     cur = mysql.connection.cursor()
     try:
         cur.execute("UPDATE PURCHASE_ORDERS SET status=%s, approved_by_user_id=%s WHERE order_id=%s",
