@@ -975,8 +975,12 @@ def update_purchase_order(order_id):
         return jsonify({"message": "Need: status (DRAFT / APPROVED / SENT / RECEIVED / CANCELLED)"}), 400
     cur = mysql.connection.cursor()
     try:
-        cur.execute("UPDATE PURCHASE_ORDERS SET status=%s, approved_by_user_id=%s WHERE order_id=%s",
-                    (new_status, current_user_id, order_id))
+        if new_status == 'CANCELLED':
+            cur.execute("UPDATE PURCHASE_ORDERS SET status=%s, approved_by_user_id=%s, date_cancelled=NOW() WHERE order_id=%s",
+                        (new_status, current_user_id, order_id))
+        else:
+            cur.execute("UPDATE PURCHASE_ORDERS SET status=%s, approved_by_user_id=%s WHERE order_id=%s",
+                        (new_status, current_user_id, order_id))
         if cur.rowcount == 0:
             return jsonify({"message": "PO not found"}), 404
         mysql.connection.commit()
