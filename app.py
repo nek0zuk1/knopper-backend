@@ -719,12 +719,12 @@ def process_checkout():
     claims = get_jwt()
     current_branch_id = claims['branch']
 
-   
+    # 1. SECURITY: Cashiers, Managers, and Admins can process sales
     if claims.get('role') not in ['admin', 'cashier', 'manager']:
         return jsonify({"message": "Access Denied."}), 403
 
     data = request.json
-    cart = data.get('cart') # format: [{"barcode": "4801234567", "quantity": 2}]
+    cart = data.get('cart') # Expected format: [{"barcode": "4801234567", "quantity": 2}]
     payment_method = data.get('payment_method', 'CASH')
     customer_type = data.get('customer_type', 'REGULAR')
 
@@ -733,7 +733,7 @@ def process_checkout():
 
     cur = mysql.connection.cursor()
     try:
-      
+        # 2. CREATE SALES HEADER
         sale_date = datetime.now()
         cur.execute("""
             INSERT INTO SALES_HEADERS (branch_id, user_id, sale_date, total_amount, payment_method, customer_type)
@@ -743,12 +743,12 @@ def process_checkout():
         sale_id = cur.lastrowid
         grand_total = 0.0
 
-        # PROCESS EACH ITEM IN THE CART
+        # 3. PROCESS EACH SCANNED ITEM IN THE CART
         for item in cart:
-            scanned_barcode = item.get('barcode') 
+            scanned_barcode = item.get('barcode') # Reading the barcode string from the scanner
             qty_to_sell = item.get('quantity')
 
-          
+            # We JOIN the Barcode table with Products and Inventory
             cur.execute("""
                 SELECT bi.inventory_id, bi.quantity_on_hand, p.price_regular, p.product_id
                 FROM PRODUCT_BARCODES pb
@@ -762,12 +762,12 @@ def process_checkout():
             if not stock_item:
                 raise Exception(f"Barcode '{scanned_barcode}' is out of stock or not registered in your branch.")
 
-            # Retrieve stock item details
+            # Unpack the queried data
             inv_id = stock_item[0]
             current_qty = stock_item[1]
             price = stock_item[2]
-            prod_id = stock_item[3] 
-            
+            prod_id = stock_item[3] # We need this to update the global product total
+
             if qty_to_sell > current_qty:
                 raise Exception(f"Insufficient stock for Barcode '{scanned_barcode}'. Only {current_qty} left.")
 
@@ -810,7 +810,6 @@ def process_checkout():
         return jsonify({"error": str(e)}), 400
     finally:
         cur.close()
-
 
 
 
