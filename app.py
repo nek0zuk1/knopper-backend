@@ -813,12 +813,7 @@ def process_checkout():
 
 
 
-
-
-
-
-
-#----- procurement routes ---------------------------------
+#-------------------Procurement/Stock Management-------------------#
 def next_id(cursor, table, id_col):
     """Auto-generate the next ID for any table."""
     cursor.execute(f"SELECT IFNULL(MAX({id_col}), 0) + 1 FROM {table}")
