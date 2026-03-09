@@ -999,11 +999,16 @@ def receive_delivery():
         return jsonify({"message": "Access Denied"}), 403
     data     = request.json
     order_id = data.get('order_id')
-    items    = data.get('items', [])
-    if not all([order_id, items]):
-        return jsonify({"message": "Need: order_id, items"}), 400
+    if not order_id:
+        return jsonify({"message": "Need: order_id"}), 400
     cur = mysql.connection.cursor()
     try:
+        # Auto-fetch all items from the PO
+        cur.execute("SELECT po_item_id, quantity_ordered FROM PURCHASE_ORDER_ITEMS WHERE order_id=%s", (order_id,))
+        items = cur.fetchall()
+        if not items:
+            return jsonify({"message": "No items found for this PO"}), 404
+
         receipt_id = next_id(cur, 'RECEIVING_REPORTS', 'receipt_id')
         cur.execute("""
             INSERT INTO RECEIVING_REPORTS
@@ -1015,11 +1020,9 @@ def receive_delivery():
             cur.execute("""
                 INSERT INTO RECEIPT_ITEMS
                 (receipt_item_id, receipt_id, po_item_id, quantity_received, batch_number, expiry_date)
-                VALUES (%s, %s, %s, %s, %s, %s)
-            """, (receipt_item_id, receipt_id, item.get('po_item_id'),
-                  item.get('quantity'), item.get('batch', 'BATCH-001'), item.get('expiry')))
-            cur.execute("UPDATE PURCHASE_ORDER_ITEMS SET item_status='RECEIVED' WHERE po_item_id=%s",
-                        (item.get('po_item_id'),))
+                VALUES (%s, %s, %s, %s, 'BATCH-001', NULL)
+            """, (receipt_item_id, receipt_id, item[0], item[1]))
+            cur.execute("UPDATE PURCHASE_ORDER_ITEMS SET item_status='RECEIVED' WHERE po_item_id=%s", (item[0],))
         cur.execute("UPDATE PURCHASE_ORDERS SET status='RECEIVED' WHERE order_id=%s", (order_id,))
         mysql.connection.commit()
         return jsonify({"message": f"Delivery recorded for PO {order_id}!"}), 201
@@ -1075,7 +1078,6 @@ def create_transfer():
         return jsonify({"error": str(e)}), 500
     finally:
         cur.close()
-
 
 
 
