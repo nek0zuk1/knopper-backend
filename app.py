@@ -873,7 +873,7 @@ def get_purchase_order(order_id):
         cur.execute("""
             SELECT po.order_id, po.order_date, po.status, po.total_amount,
                    s.supplier_name, b.branch_name,
-                   creator.full_name, approver.full_name, rr.date_received
+                   creator.full_name, approver.full_name, rr.date_received, po.date_cancelled
             FROM PURCHASE_ORDERS po
             LEFT JOIN SUPPLIERS s ON po.supplier_id = s.supplier_id
             LEFT JOIN BRANCHES b ON po.branch_id = b.branch_id
@@ -906,6 +906,7 @@ def get_purchase_order(order_id):
             'created_by': po[6],
             'approved_by': po[7],
             'date_received': po[8].strftime('%Y-%m-%d %H:%M') if po[8] else None,
+            'date_cancelled': po[9].strftime('%Y-%m-%d %H:%M') if po[9] else None,
             'items': [{
                 'po_item_id': i[0],
                 'product': i[1],
@@ -919,7 +920,6 @@ def get_purchase_order(order_id):
         return jsonify({'error': str(e)}), 500
     finally:
         cur.close()
-
 # POST /purchase-orders
 # Send: supplier_id, branch_id, items[{product_id, quantity, cost}]
 @app.route('/procurement', methods=['POST'])
