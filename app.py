@@ -969,6 +969,67 @@ def get_receipt(sale_id):
     finally:
         cur.close()
 
+
+#  SHOW DAILY SALES REPORT
+
+@app.route('/pos/daily-sales', methods=['GET'])
+@jwt_required()
+def get_daily_sales():
+    claims = get_jwt()
+    current_branch_id = claims['branch']
+    
+    if claims.get('role') not in ['admin', 'manager', 'cashier']:
+        return jsonify({"message": "Access Denied."}), 403
+
+    # Accept a date from the URL (e.g., ?date=2026-03-10), otherwise default to today
+    target_date = request.args.get('date', datetime.now().strftime('%Y-%m-%d'))
+
+    cur = mysql.connection.cursor()
+    try:
+        # GET THE GRAND TOTALS FOR THE DAY
+        cur.execute("""
+            SELECT 
+                COUNT(sale_id) AS total_transactions,
+                IFNULL(SUM(total_amount), 0) AS total_revenue,
+                IFNULL(SUM(tax_amount), 0) AS total_vat,
+                IFNULL(SUM(discount_total), 0) AS total_discounts
+            FROM SALES_HEADERS
+            WHERE branch_id = %s AND DATE(sale_date) = %s
+        """, (current_branch_id, target_date))
+        
+        summary = cur.fetchone()
+
+        cur.execute("""
+            SELECT payment_method, IFNULL(SUM(total_amount), 0) 
+            FROM SALES_HEADERS
+            WHERE branch_id = %s AND DATE(sale_date) = %s
+            GROUP BY payment_method
+        """, (current_branch_id, target_date))
+        
+        payment_breakdown = cur.fetchall()
+        
+        payments = {}
+        for row in payment_breakdown:
+            payments[row[0]] = round(float(row[1]), 2)
+
+        report = {
+            "branch_id": current_branch_id,
+            "report_date": target_date,
+            "summary": {
+                "total_transactions": summary[0],
+                "total_revenue": round(float(summary[1]), 2),
+                "total_vat_collected": round(float(summary[2]), 2),
+                "total_discounts_given": round(float(summary[3]), 2)
+            },
+            "payment_breakdown": payments
+        }
+
+        return jsonify(report), 200
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+    finally:
+        cur.close()
 #-------------------Procurement/Stock Management-------------------#
 
 def next_id(cursor, table, id_col):
