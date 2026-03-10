@@ -862,10 +862,9 @@ def process_checkout():
         # 3. UPDATE HEADER
         cur.execute("""
             UPDATE SALES_HEADERS 
-            SET total_amount = %s, tax_amount = %s, discount_total = %s 
+            SET total_amount = %s, tax_amount = %s, discount_total = %s, amount_tendered = %s, change_due = %s
             WHERE sale_id = %s
-        """, (grand_total, total_vat, total_discount, sale_id))
-
+        """, (grand_total, total_vat, total_discount, amount_tendered, change_due, sale_id))
         mysql.connection.commit()
         
         return jsonify({
