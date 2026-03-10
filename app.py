@@ -978,7 +978,6 @@ def get_receipt(sale_id):
 
 #-------------------Procurement/Stock Management-------------------#
 
-
 def next_id(cursor, table, id_col):
     """Auto-generate the next ID for any table."""
     cursor.execute(f"SELECT IFNULL(MAX({id_col}), 0) + 1 FROM {table}")
@@ -1186,8 +1185,13 @@ def receive_delivery():
         if po[0] == 'RECEIVED':
             return jsonify({"message": "This PO has already been received!"}), 400
 
-        # Auto-fetch all items from the PO
-        cur.execute("SELECT po_item_id, quantity_ordered FROM PURCHASE_ORDER_ITEMS WHERE order_id=%s", (order_id,))
+        # Auto-fetch all items from the PO including product_id and branch_id
+        cur.execute("""
+            SELECT poi.po_item_id, poi.quantity_ordered, poi.product_id, po.branch_id
+            FROM PURCHASE_ORDER_ITEMS poi
+            JOIN PURCHASE_ORDERS po ON poi.order_id = po.order_id
+            WHERE poi.order_id = %s
+        """, (order_id,))
         items = cur.fetchall()
         if not items:
             return jsonify({"message": "No items found for this PO"}), 404
@@ -1199,13 +1203,26 @@ def receive_delivery():
             VALUES (%s, %s, %s, NOW())
         """, (receipt_id, order_id, current_user_id))
         for item in items:
+            po_item_id, quantity, product_id, branch_id = item
+
+            # Pull batch and expiry from BRANCH_INVENTORY
+            cur.execute("""
+                SELECT batch_number, expiry_date
+                FROM BRANCH_INVENTORY
+                WHERE product_id = %s AND branch_id = %s
+                LIMIT 1
+            """, (product_id, branch_id))
+            inv = cur.fetchone()
+            batch  = inv[0] if inv and inv[0] else None
+            expiry = inv[1] if inv and inv[1] else None
+
             receipt_item_id = next_id(cur, 'RECEIPT_ITEMS', 'receipt_item_id')
             cur.execute("""
                 INSERT INTO RECEIPT_ITEMS
                 (receipt_item_id, receipt_id, po_item_id, quantity_received, batch_number, expiry_date)
-                VALUES (%s, %s, %s, %s, 'BATCH-001', NULL)
-            """, (receipt_item_id, receipt_id, item[0], item[1]))
-            cur.execute("UPDATE PURCHASE_ORDER_ITEMS SET item_status='RECEIVED' WHERE po_item_id=%s", (item[0],))
+                VALUES (%s, %s, %s, %s, %s, %s)
+            """, (receipt_item_id, receipt_id, po_item_id, quantity, batch, expiry))
+            cur.execute("UPDATE PURCHASE_ORDER_ITEMS SET item_status='RECEIVED' WHERE po_item_id=%s", (po_item_id,))
         cur.execute("UPDATE PURCHASE_ORDERS SET status='RECEIVED' WHERE order_id=%s", (order_id,))
         mysql.connection.commit()
         return jsonify({"message": f"Delivery recorded for PO {order_id}!"}), 201
@@ -1242,18 +1259,31 @@ def create_transfer():
             VALUES (%s, %s, %s, %s, NOW(), 'IN_TRANSIT')
         """, (manifest_id, current_user_id, from_branch, to_branch))
         for item in items:
+            product_id = item.get('product_id')
+            quantity   = item.get('quantity')
+
+            # Auto-pull batch and expiry from BRANCH_INVENTORY
+            cur.execute("""
+                SELECT batch_number, expiry_date
+                FROM BRANCH_INVENTORY
+                WHERE product_id = %s AND branch_id = %s
+                LIMIT 1
+            """, (product_id, from_branch))
+            inv = cur.fetchone()
+            batch  = inv[0] if inv and inv[0] else None
+            expiry = inv[1] if inv and inv[1] else None
+
             transfer_item_id = next_id(cur, 'TRANSFER_ITEMS', 'transfer_item_id')
-            batch = item.get('batch', 'BATCH-001')
             cur.execute("""
                 INSERT INTO TRANSFER_ITEMS
                 (transfer_item_id, manifest_id, product_id, batch_number, quantity_sent, quantity_received)
                 VALUES (%s, %s, %s, %s, %s, 0)
-            """, (transfer_item_id, manifest_id, item.get('product_id'), batch, item.get('quantity')))
+            """, (transfer_item_id, manifest_id, product_id, batch, quantity))
             cur.execute("""
                 UPDATE BRANCH_INVENTORY
                 SET quantity_on_hand = quantity_on_hand - %s
                 WHERE product_id=%s AND branch_id=%s AND batch_number=%s
-            """, (item.get('quantity'), item.get('product_id'), from_branch, batch))
+            """, (quantity, product_id, from_branch, batch))
         mysql.connection.commit()
         return jsonify({"message": "Transfer created!", "manifest_id": manifest_id}), 201
     except Exception as e:
@@ -1263,6 +1293,86 @@ def create_transfer():
         cur.close()
 
 
+
+
+# PUT /procurement/transfer/<manifest_id>/deliver
+# Confirms delivery of a transfer and updates stock in the receiving branch
+@app.route('/procurement/transfer/<int:manifest_id>/deliver', methods=['PUT'])
+@jwt_required()
+def confirm_transfer_delivery(manifest_id):
+    claims = get_jwt()
+    current_user_id = int(get_jwt_identity())
+    if claims['role'] not in ['admin', 'manager']:
+        return jsonify({"message": "Access Denied"}), 403
+    cur = mysql.connection.cursor()
+    try:
+        # Check manifest exists and is still IN_TRANSIT
+        cur.execute("SELECT status, to_branch_id FROM TRANSFER_MANIFEST WHERE manifest_id=%s", (manifest_id,))
+        manifest = cur.fetchone()
+        if not manifest:
+            return jsonify({"message": "Transfer manifest not found"}), 404
+        if manifest[0] == 'DELIVERED':
+            return jsonify({"message": "This transfer has already been delivered!"}), 400
+        if manifest[0] != 'IN_TRANSIT':
+            return jsonify({"message": "Only IN_TRANSIT transfers can be confirmed"}), 400
+
+        to_branch = manifest[1]
+
+        # Fetch all transfer items
+        cur.execute("""
+            SELECT product_id, batch_number, quantity_sent
+            FROM TRANSFER_ITEMS
+            WHERE manifest_id = %s
+        """, (manifest_id,))
+        items = cur.fetchall()
+        if not items:
+            return jsonify({"message": "No items found for this transfer"}), 404
+
+        for item in items:
+            product_id, batch_number, quantity_sent = item
+
+            # Update quantity_received in TRANSFER_ITEMS
+            cur.execute("""
+                UPDATE TRANSFER_ITEMS
+                SET quantity_received = quantity_sent
+                WHERE manifest_id = %s AND product_id = %s
+            """, (manifest_id, product_id))
+
+            # Add stock to receiving branch inventory
+            cur.execute("""
+                SELECT inventory_id FROM BRANCH_INVENTORY
+                WHERE branch_id = %s AND product_id = %s AND batch_number = %s
+            """, (to_branch, product_id, batch_number))
+            existing = cur.fetchone()
+
+            if existing:
+                cur.execute("""
+                    UPDATE BRANCH_INVENTORY
+                    SET quantity_on_hand = quantity_on_hand + %s
+                    WHERE inventory_id = %s
+                """, (quantity_sent, existing[0]))
+            else:
+                inventory_id = next_id(cur, 'BRANCH_INVENTORY', 'inventory_id')
+                cur.execute("""
+                    INSERT INTO BRANCH_INVENTORY
+                    (inventory_id, branch_id, product_id, batch_number, quantity_on_hand)
+                    VALUES (%s, %s, %s, %s, %s)
+                """, (inventory_id, to_branch, product_id, batch_number, quantity_sent))
+
+        # Mark manifest as DELIVERED
+        cur.execute("""
+            UPDATE TRANSFER_MANIFEST
+            SET status = 'DELIVERED', date_arrived = NOW()
+            WHERE manifest_id = %s
+        """, (manifest_id,))
+
+        mysql.connection.commit()
+        return jsonify({"message": f"Transfer {manifest_id} marked as DELIVERED!"}), 200
+    except Exception as e:
+        mysql.connection.rollback()
+        return jsonify({"error": str(e)}), 500
+    finally:
+        cur.close()
 
 if __name__ == '__main__':
     app.run(debug=True)
