@@ -755,6 +755,9 @@ def process_checkout():
     cart = data.get('cart') 
     payment_method = data.get('payment_method', 'CASH')
     customer_type = data.get('customer_type', 'REGULAR').upper().strip() 
+    
+    # NEW: Get the cash handed to the cashier (default to 0.0 if not provided)
+    amount_tendered = float(data.get('amount_tendered', 0.0))
 
     if not cart or not isinstance(cart, list) or len(cart) == 0:
         return jsonify({"message": "Cart is empty or invalid format."}), 400
@@ -770,19 +773,17 @@ def process_checkout():
         
         sale_id = cur.lastrowid
         
-        # Grand totals
         raw_subtotal = 0.0
         total_discount = 0.0
         total_vat = 0.0
         grand_total = 0.0
 
-        # 2. PROCESS EACH SCANNED ITEM IN THE CART
+        # 2. PROCESS EACH SCANNED ITEM
         for item in cart:
             scanned_barcode = item.get('barcode') 
             manual_product_id = item.get('product_id')
             qty_to_sell = item.get('quantity')
 
-            # Removed the is_vat_exempt check from the SQL queries
             if scanned_barcode:
                 cur.execute("""
                     SELECT bi.inventory_id, bi.quantity_on_hand, p.price_regular, p.product_id
@@ -808,10 +809,7 @@ def process_checkout():
                 identifier = scanned_barcode if scanned_barcode else manual_product_id
                 raise Exception(f"Item '{identifier}' is out of stock or not registered.")
 
-            inv_id = stock_item[0]
-            current_qty = stock_item[1]
-            price = float(stock_item[2])
-            prod_id = stock_item[3]
+            inv_id, current_qty, price, prod_id = stock_item[0], stock_item[1], float(stock_item[2]), stock_item[3]
 
             if qty_to_sell > current_qty:
                 raise Exception(f"Insufficient stock for Item {prod_id}. Only {current_qty} left.")
@@ -819,27 +817,24 @@ def process_checkout():
             line_total = price * qty_to_sell
             raw_subtotal += line_total
 
-            # --- SIMPLIFIED ITEM-LEVEL MATH ---
+            # Item Math
             item_discount = 0.0
             item_vat = 0.0
             item_payable = 0.0
 
             if customer_type == 'DISCOUNTED':
-                # Straight 20% discount off the shelf price
                 item_discount = line_total * 0.20
                 item_payable = line_total - item_discount
                 item_vat = 0.00
             else: 
-                # REGULAR CUSTOMER
                 item_payable = line_total
-                # Standard 12% VAT inclusive calculation
                 item_vat = line_total - (line_total / 1.12)
 
             total_discount += item_discount
             total_vat += item_vat
             grand_total += item_payable
 
-            # --- DEDUCT INVENTORY ---
+            # Deduct Inventory
             new_qty = current_qty - qty_to_sell
             if new_qty > 0:
                 cur.execute("UPDATE BRANCH_INVENTORY SET quantity_on_hand = %s WHERE inventory_id = %s", (new_qty, inv_id))
@@ -853,7 +848,18 @@ def process_checkout():
                 VALUES (%s, %s, %s, %s, %s)
             """, (sale_id, inv_id, qty_to_sell, price, item_discount))
 
-        # 3. UPDATE HEADER WITH FINAL CALCULATIONS
+        # --- NEW SECURITY CHECK: Verify Cash Tendered ---
+        if payment_method == 'CASH':
+            if amount_tendered < grand_total:
+                # If they didn't hand enough cash, we roll back the entire transaction!
+                raise Exception(f"Insufficient funds. Total is ₱{grand_total:.2f}, but only ₱{amount_tendered:.2f} was tendered.")
+            change_due = amount_tendered - grand_total
+        else:
+            # If GCash or Card, change is always 0, and tendered equals exact total
+            amount_tendered = grand_total
+            change_due = 0.0
+
+        # 3. UPDATE HEADER
         cur.execute("""
             UPDATE SALES_HEADERS 
             SET total_amount = %s, tax_amount = %s, discount_total = %s 
@@ -870,7 +876,9 @@ def process_checkout():
             "subtotal": round(raw_subtotal, 2),
             "discount_applied": round(total_discount, 2),
             "vat_amount": round(total_vat, 2),
-            "total_paid": round(grand_total, 2)
+            "total_paid": round(grand_total, 2),
+            "amount_tendered": round(amount_tendered, 2), # NEW
+            "change_due": round(change_due, 2)            # NEW
         }), 201
 
     except Exception as e:
