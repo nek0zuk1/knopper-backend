@@ -754,14 +754,14 @@ def process_checkout():
     data = request.json
     cart = data.get('cart') 
     payment_method = data.get('payment_method', 'CASH')
-    customer_type = data.get('customer_type', 'REGULAR').upper() # Force uppercase for logic checks
+    customer_type = data.get('customer_type', 'REGULAR').upper() 
 
     if not cart or not isinstance(cart, list) or len(cart) == 0:
         return jsonify({"message": "Cart is empty or invalid format."}), 400
 
     cur = mysql.connection.cursor()
     try:
-        # 2. CREATE SALES HEADER
+        # 1. CREATE SALES HEADER
         sale_date = datetime.now()
         cur.execute("""
             INSERT INTO SALES_HEADERS (branch_id, user_id, sale_date, total_amount, tax_amount, discount_total, payment_method, customer_type)
@@ -769,17 +769,23 @@ def process_checkout():
         """, (current_branch_id, current_user_id, sale_date, payment_method, customer_type))
         
         sale_id = cur.lastrowid
-        raw_subtotal = 0.0 # The sum of shelf prices
+        
+        # Grand totals to be updated at the end
+        raw_subtotal = 0.0
+        total_discount = 0.0
+        total_vat = 0.0
+        grand_total = 0.0
 
-        # 3. PROCESS EACH ITEM IN THE CART
+        # 2. PROCESS EACH SCANNED ITEM IN THE CART
         for item in cart:
             scanned_barcode = item.get('barcode') 
             manual_product_id = item.get('product_id')
             qty_to_sell = item.get('quantity')
 
+            # Fetch IFNULL(p.is_vat_exempt, 1) so NULL defaults to 1 (Exempt)
             if scanned_barcode:
                 cur.execute("""
-                    SELECT bi.inventory_id, bi.quantity_on_hand, p.price_regular, p.product_id
+                    SELECT bi.inventory_id, bi.quantity_on_hand, p.price_regular, p.product_id, IFNULL(p.is_vat_exempt, 1)
                     FROM PRODUCT_BARCODES pb
                     JOIN PRODUCTS p ON pb.product_id = p.product_id
                     JOIN BRANCH_INVENTORY bi ON p.product_id = bi.product_id
@@ -788,7 +794,7 @@ def process_checkout():
                 """, (scanned_barcode, current_branch_id))
             elif manual_product_id:
                 cur.execute("""
-                    SELECT bi.inventory_id, bi.quantity_on_hand, p.price_regular, p.product_id
+                    SELECT bi.inventory_id, bi.quantity_on_hand, p.price_regular, p.product_id, IFNULL(p.is_vat_exempt, 1)
                     FROM BRANCH_INVENTORY bi
                     JOIN PRODUCTS p ON bi.product_id = p.product_id
                     WHERE bi.product_id = %s AND bi.branch_id = %s AND bi.quantity_on_hand > 0
@@ -802,16 +808,47 @@ def process_checkout():
                 identifier = scanned_barcode if scanned_barcode else manual_product_id
                 raise Exception(f"Item '{identifier}' is out of stock or not registered.")
 
-            inv_id, current_qty, price, prod_id = stock_item[0], stock_item[1], float(stock_item[2]), stock_item[3]
+            inv_id = stock_item[0]
+            current_qty = stock_item[1]
+            price = float(stock_item[2])
+            prod_id = stock_item[3]
+            is_vat_exempt = int(stock_item[4]) # 1 for Exempt, 0 for Vatable
 
             if qty_to_sell > current_qty:
                 raise Exception(f"Insufficient stock for Item {prod_id}. Only {current_qty} left.")
 
-            # Calculate raw line total
+            # Calculate raw shelf price for this item line
             line_total = price * qty_to_sell
             raw_subtotal += line_total
 
-            # Deduct from Inventory
+            # --- ITEM-LEVEL MATH ---
+            item_discount = 0.0
+            item_vat = 0.0
+            item_payable = 0.0
+
+            if customer_type == 'DISCOUNTED':
+                if is_vat_exempt == 1:
+                    # VAT Exempt product: Straight 20% discount (e.g., 11.00 -> 8.80)
+                    item_discount = line_total * 0.20
+                    item_payable = line_total - item_discount
+                else:
+                    # Vatable product: Legally, remove 12% VAT first, then apply 20% discount
+                    vat_free_price = line_total / 1.12
+                    item_discount = vat_free_price * 0.20
+                    item_payable = vat_free_price - item_discount
+            else: 
+                # REGULAR CUSTOMER
+                item_payable = line_total
+                if is_vat_exempt == 0:
+                    # Extract 12% VAT from the inclusive shelf price
+                    item_vat = line_total - (line_total / 1.12)
+
+            # Add to receipt totals
+            total_discount += item_discount
+            total_vat += item_vat
+            grand_total += item_payable
+
+            # --- DEDUCT INVENTORY ---
             new_qty = current_qty - qty_to_sell
             if new_qty > 0:
                 cur.execute("UPDATE BRANCH_INVENTORY SET quantity_on_hand = %s WHERE inventory_id = %s", (new_qty, inv_id))
@@ -820,31 +857,18 @@ def process_checkout():
 
             cur.execute("UPDATE PRODUCTS SET total_stock_quantity = total_stock_quantity - %s WHERE product_id = %s", (qty_to_sell, prod_id))
 
+            # Record in SALES_DETAILS including the specific discount applied to this item
             cur.execute("""
                 INSERT INTO SALES_DETAILS (sale_id, inventory_id, quantity_sold, price_at_sale, discount_applied)
-                VALUES (%s, %s, %s, %s, 0.00)
-            """, (sale_id, inv_id, qty_to_sell, price))
+                VALUES (%s, %s, %s, %s, %s)
+            """, (sale_id, inv_id, qty_to_sell, price, item_discount))
 
-        # 4. COMPUTE VAT AND DISCOUNTS
-        if customer_type in ['SENIOR', 'PWD']:
-            # VAT Exempt Math: Remove 12% VAT, then calculate 20% discount
-            vat_exempt_sales = raw_subtotal / 1.12
-            discount_amount = vat_exempt_sales * 0.20
-            grand_total = vat_exempt_sales - discount_amount
-            tax_amount = 0.00
-        else:
-            # Regular Math: VAT is inclusive in the price
-            discount_amount = 0.00
-            grand_total = raw_subtotal
-            # Formula to find how much of the total is VAT: Total - (Total / 1.12)
-            tax_amount = raw_subtotal - (raw_subtotal / 1.12)
-
-        # 5. UPDATE HEADER WITH FINAL CALCULATIONS
+        # 3. UPDATE HEADER WITH FINAL CALCULATIONS
         cur.execute("""
             UPDATE SALES_HEADERS 
             SET total_amount = %s, tax_amount = %s, discount_total = %s 
             WHERE sale_id = %s
-        """, (grand_total, tax_amount, discount_amount, sale_id))
+        """, (grand_total, total_vat, total_discount, sale_id))
 
         mysql.connection.commit()
         
@@ -854,8 +878,8 @@ def process_checkout():
             "receipt_number": sale_id,
             "items_purchased": len(cart),
             "subtotal": round(raw_subtotal, 2),
-            "discount_applied": round(discount_amount, 2),
-            "vat_amount": round(tax_amount, 2),
+            "discount_applied": round(total_discount, 2),
+            "vat_amount": round(total_vat, 2),
             "total_paid": round(grand_total, 2)
         }), 201
 
@@ -864,7 +888,6 @@ def process_checkout():
         return jsonify({"error": str(e)}), 400
     finally:
         cur.close()
-
 # GET RECEIPT BY SALE ID
 
 @app.route('/pos/receipt/<int:sale_id>', methods=['GET'])
