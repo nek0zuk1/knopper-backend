@@ -841,6 +841,83 @@ def process_checkout():
         cur.close()
 
 
+#  POS - GET RECEIPT BY SALE ID
+
+@app.route('/pos/receipt/<int:sale_id>', methods=['GET'])
+@jwt_required()
+def get_receipt(sale_id):
+    # 1. SECURITY CHECK
+    claims = get_jwt()
+    if claims.get('role') not in ['admin', 'cashier', 'manager']:
+        return jsonify({"message": "Access Denied."}), 403
+
+    cur = mysql.connection.cursor()
+    try:
+        # 2. FETCH RECEIPT HEADER (Store Info, Cashier, Totals)
+        header_sql = """
+            SELECT 
+                sh.sale_id, 
+                sh.sale_date, 
+                sh.total_amount, 
+                sh.payment_method, 
+                sh.customer_type, 
+                u.full_name AS cashier_name, 
+                b.branch_name
+            FROM SALES_HEADERS sh
+            JOIN USERS u ON sh.user_id = u.user_id
+            JOIN BRANCHES b ON sh.branch_id = b.branch_id
+            WHERE sh.sale_id = %s
+        """
+        cur.execute(header_sql, (sale_id,))
+        header = cur.fetchone()
+
+        if not header:
+            return jsonify({"message": f"Receipt #{sale_id} not found."}), 404
+
+        # 3. FETCH RECEIPT ITEMS (The individual products bought)
+        items_sql = """
+            SELECT 
+                p.product_name_official, 
+                sd.quantity_sold, 
+                sd.price_at_sale, 
+                (sd.quantity_sold * sd.price_at_sale) AS line_total
+            FROM SALES_DETAILS sd
+            JOIN BRANCH_INVENTORY bi ON sd.inventory_id = bi.inventory_id
+            JOIN PRODUCTS p ON bi.product_id = p.product_id
+            WHERE sd.sale_id = %s
+        """
+        cur.execute(items_sql, (sale_id,))
+        items = cur.fetchall()
+
+        # 4. FORMAT THE OUTPUT FOR THE FRONTEND PRINTER
+        item_list = []
+        for item in items:
+            item_list.append({
+                "product_name": item[0],
+                "qty": item[1],
+                "unit_price": float(item[2]),
+                "subtotal": float(item[3])
+            })
+
+        receipt_data = {
+            "store_name": "Knopper Pharmacy",
+            "branch": header[6],
+            "receipt_number": f"INV-{header[0]:06d}", # Formats as INV-000001
+            "date": header[1].strftime('%Y-%m-%d %H:%M:%S'),
+            "cashier": header[5],
+            "customer_type": header[4],
+            "payment_method": header[3],
+            "items": item_list,
+            "grand_total": float(header[2])
+        }
+
+        return jsonify(receipt_data), 200
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+    finally:
+        cur.close()
+
 
 #-------------------Procurement/Stock Management-------------------#
 
