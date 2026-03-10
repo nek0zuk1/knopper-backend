@@ -897,7 +897,7 @@ def get_receipt(sale_id):
 
     cur = mysql.connection.cursor()
     try:
-        # Fetch Header, now including tax and discount columns
+        # Fetch Header (Now grabs tendered and change columns)
         header_sql = """
             SELECT 
                 sh.sale_id, 
@@ -908,7 +908,9 @@ def get_receipt(sale_id):
                 u.full_name AS cashier_name, 
                 b.branch_name,
                 sh.tax_amount,
-                sh.discount_total
+                sh.discount_total,
+                sh.amount_tendered,
+                sh.change_due
             FROM SALES_HEADERS sh
             JOIN USERS u ON sh.user_id = u.user_id
             JOIN BRANCHES b ON sh.branch_id = b.branch_id
@@ -920,13 +922,14 @@ def get_receipt(sale_id):
         if not header:
             return jsonify({"message": f"Receipt #{sale_id} not found."}), 404
 
-        # Fetch Items
+       
         items_sql = """
             SELECT 
                 p.product_name_official, 
                 sd.quantity_sold, 
                 sd.price_at_sale, 
-                (sd.quantity_sold * sd.price_at_sale) AS line_total
+                (sd.quantity_sold * sd.price_at_sale) AS line_total,
+                sd.discount_applied
             FROM SALES_DETAILS sd
             JOIN BRANCH_INVENTORY bi ON sd.inventory_id = bi.inventory_id
             JOIN PRODUCTS p ON bi.product_id = p.product_id
@@ -944,7 +947,8 @@ def get_receipt(sale_id):
                 "product_name": item[0],
                 "qty": item[1],
                 "unit_price": float(item[2]),
-                "subtotal": line_total
+                "subtotal": line_total,
+                "item_discount": float(item[4])
             })
 
         receipt_data = {
@@ -960,7 +964,9 @@ def get_receipt(sale_id):
                 "subtotal": round(raw_subtotal, 2),
                 "vat_amount": round(float(header[7]), 2),
                 "discount_amount": round(float(header[8]), 2),
-                "grand_total": round(float(header[2]), 2)
+                "grand_total": round(float(header[2]), 2),
+                "amount_tendered": round(float(header[9]), 2) if header[9] is not None else round(float(header[2]), 2),
+                "change_due": round(float(header[10]), 2) if header[10] is not None else 0.00
             }
         }
 
@@ -970,7 +976,6 @@ def get_receipt(sale_id):
         return jsonify({"error": str(e)}), 500
     finally:
         cur.close()
-
 
 #-------------------Procurement/Stock Management-------------------#
 
