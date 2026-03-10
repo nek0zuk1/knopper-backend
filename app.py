@@ -756,7 +756,6 @@ def process_checkout():
     payment_method = data.get('payment_method', 'CASH')
     customer_type = data.get('customer_type', 'REGULAR').upper().strip() 
     
-    # NEW: Get the cash handed to the cashier (default to 0.0 if not provided)
     amount_tendered = float(data.get('amount_tendered', 0.0))
 
     if not cart or not isinstance(cart, list) or len(cart) == 0:
@@ -778,7 +777,7 @@ def process_checkout():
         total_vat = 0.0
         grand_total = 0.0
 
-        # 2. PROCESS EACH SCANNED ITEM
+        # 2. PROCESS EACH  ITEM
         for item in cart:
             scanned_barcode = item.get('barcode') 
             manual_product_id = item.get('product_id')
@@ -811,6 +810,7 @@ def process_checkout():
 
             inv_id, current_qty, price, prod_id = stock_item[0], stock_item[1], float(stock_item[2]), stock_item[3]
 
+            # SAFETY GATE: Prevents negative stock mathematically
             if qty_to_sell > current_qty:
                 raise Exception(f"Insufficient stock for Item {prod_id}. Only {current_qty} left.")
 
@@ -834,12 +834,9 @@ def process_checkout():
             total_vat += item_vat
             grand_total += item_payable
 
-            # Deduct Inventory
+    
             new_qty = current_qty - qty_to_sell
-            if new_qty > 0:
-                cur.execute("UPDATE BRANCH_INVENTORY SET quantity_on_hand = %s WHERE inventory_id = %s", (new_qty, inv_id))
-            else:
-                cur.execute("DELETE FROM BRANCH_INVENTORY WHERE inventory_id = %s", (inv_id,))
+            cur.execute("UPDATE BRANCH_INVENTORY SET quantity_on_hand = %s WHERE inventory_id = %s", (new_qty, inv_id))
 
             cur.execute("UPDATE PRODUCTS SET total_stock_quantity = total_stock_quantity - %s WHERE product_id = %s", (qty_to_sell, prod_id))
 
@@ -848,18 +845,14 @@ def process_checkout():
                 VALUES (%s, %s, %s, %s, %s)
             """, (sale_id, inv_id, qty_to_sell, price, item_discount))
 
-        # --- NEW SECURITY CHECK: Verify Cash Tendered ---
         if payment_method == 'CASH':
             if amount_tendered < grand_total:
-                # If they didn't hand enough cash, we roll back the entire transaction!
                 raise Exception(f"Insufficient funds. Total is ₱{grand_total:.2f}, but only ₱{amount_tendered:.2f} was tendered.")
             change_due = amount_tendered - grand_total
         else:
-            # If GCash or Card, change is always 0, and tendered equals exact total
             amount_tendered = grand_total
             change_due = 0.0
 
-        # 3. UPDATE HEADER
         cur.execute("""
             UPDATE SALES_HEADERS 
             SET total_amount = %s, tax_amount = %s, discount_total = %s, amount_tendered = %s, change_due = %s
@@ -876,8 +869,8 @@ def process_checkout():
             "discount_applied": round(total_discount, 2),
             "vat_amount": round(total_vat, 2),
             "total_paid": round(grand_total, 2),
-            "amount_tendered": round(amount_tendered, 2), # NEW
-            "change_due": round(change_due, 2)            # NEW
+            "amount_tendered": round(amount_tendered, 2), 
+            "change_due": round(change_due, 2)            
         }), 201
 
     except Exception as e:
