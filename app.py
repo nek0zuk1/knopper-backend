@@ -741,23 +741,6 @@ def get_audit_log(branch_id):
 
 
 # POS - PROCESS SALE 
-That is a very smart move. It is always best to confirm the exact pricing and tax strategy with your boss or accountant before hardcoding complex laws into your POS system!
-
-Here is the simplified version of your /pos/checkout route. I have completely stripped out the is_vat_exempt database checks.
-
-Now, the math is incredibly straightforward:
-
-If DISCOUNTED: It takes a straight 20% off the shelf price (e.g., 100.00 becomes 80.00).
-
-If REGULAR: It charges the full shelf price, and simply calculates the 12% inclusive VAT for the receipt (e.g., 100.00 total, with 10.71 of that being VAT).
-
-The Simplified Checkout Route
-Replace your current /pos/checkout route with this clean version:
-
-Python
-# ==========================================
-# ROUTE: POS - PROCESS SALE (Simplified Math)
-# ==========================================
 @app.route('/pos/checkout', methods=['POST'])
 @jwt_required()
 def process_checkout():
