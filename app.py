@@ -740,7 +740,7 @@ def get_audit_log(branch_id):
 # ----------------------------------POS----------------------
 
 
-# ROUTE: POS - PROCESS SALE 
+# POS - PROCESS SALE 
 @app.route('/pos/checkout', methods=['POST'])
 @jwt_required()
 def process_checkout():
@@ -748,14 +748,13 @@ def process_checkout():
     claims = get_jwt()
     current_branch_id = claims['branch']
 
-    # 1. SECURITY: Cashiers, Managers, and Admins can process sales
     if claims.get('role') not in ['admin', 'cashier', 'manager']:
         return jsonify({"message": "Access Denied."}), 403
 
     data = request.json
-    cart = data.get('cart') # Expected format: [{"barcode": "4801234567", "quantity": 2}]
+    cart = data.get('cart') 
     payment_method = data.get('payment_method', 'CASH')
-    customer_type = data.get('customer_type', 'REGULAR')
+    customer_type = data.get('customer_type', 'REGULAR').upper() # Force uppercase for logic checks
 
     if not cart or not isinstance(cart, list) or len(cart) == 0:
         return jsonify({"message": "Cart is empty or invalid format."}), 400
@@ -765,73 +764,99 @@ def process_checkout():
         # 2. CREATE SALES HEADER
         sale_date = datetime.now()
         cur.execute("""
-            INSERT INTO SALES_HEADERS (branch_id, user_id, sale_date, total_amount, payment_method, customer_type)
-            VALUES (%s, %s, %s, 0.00, %s, %s)
+            INSERT INTO SALES_HEADERS (branch_id, user_id, sale_date, total_amount, tax_amount, discount_total, payment_method, customer_type)
+            VALUES (%s, %s, %s, 0.00, 0.00, 0.00, %s, %s)
         """, (current_branch_id, current_user_id, sale_date, payment_method, customer_type))
         
         sale_id = cur.lastrowid
-        grand_total = 0.0
+        raw_subtotal = 0.0 # The sum of shelf prices
 
-        # 3. PROCESS EACH SCANNED ITEM IN THE CART
+        # 3. PROCESS EACH ITEM IN THE CART
         for item in cart:
-            scanned_barcode = item.get('barcode') # Reading the barcode string from the scanner
+            scanned_barcode = item.get('barcode') 
+            manual_product_id = item.get('product_id')
             qty_to_sell = item.get('quantity')
 
-            # We JOIN the Barcode table with Products and Inventory
-            cur.execute("""
-                SELECT bi.inventory_id, bi.quantity_on_hand, p.price_regular, p.product_id
-                FROM PRODUCT_BARCODES pb
-                JOIN PRODUCTS p ON pb.product_id = p.product_id
-                JOIN BRANCH_INVENTORY bi ON p.product_id = bi.product_id
-                WHERE pb.barcode_value = %s AND bi.branch_id = %s AND bi.quantity_on_hand > 0
-                ORDER BY bi.expiry_date ASC LIMIT 1
-            """, (scanned_barcode, current_branch_id))
+            if scanned_barcode:
+                cur.execute("""
+                    SELECT bi.inventory_id, bi.quantity_on_hand, p.price_regular, p.product_id
+                    FROM PRODUCT_BARCODES pb
+                    JOIN PRODUCTS p ON pb.product_id = p.product_id
+                    JOIN BRANCH_INVENTORY bi ON p.product_id = bi.product_id
+                    WHERE pb.barcode_value = %s AND bi.branch_id = %s AND bi.quantity_on_hand > 0
+                    ORDER BY bi.expiry_date ASC LIMIT 1
+                """, (scanned_barcode, current_branch_id))
+            elif manual_product_id:
+                cur.execute("""
+                    SELECT bi.inventory_id, bi.quantity_on_hand, p.price_regular, p.product_id
+                    FROM BRANCH_INVENTORY bi
+                    JOIN PRODUCTS p ON bi.product_id = p.product_id
+                    WHERE bi.product_id = %s AND bi.branch_id = %s AND bi.quantity_on_hand > 0
+                    ORDER BY bi.expiry_date ASC LIMIT 1
+                """, (manual_product_id, current_branch_id))
+            else:
+                raise Exception("Every item must have a 'barcode' or 'product_id'.")
             
             stock_item = cur.fetchone()
             if not stock_item:
-                raise Exception(f"Barcode '{scanned_barcode}' is out of stock or not registered in your branch.")
+                identifier = scanned_barcode if scanned_barcode else manual_product_id
+                raise Exception(f"Item '{identifier}' is out of stock or not registered.")
 
-            # Unpack the queried data
-            inv_id = stock_item[0]
-            current_qty = stock_item[1]
-            price = stock_item[2]
-            prod_id = stock_item[3] # We need this to update the global product total
+            inv_id, current_qty, price, prod_id = stock_item[0], stock_item[1], float(stock_item[2]), stock_item[3]
 
             if qty_to_sell > current_qty:
-                raise Exception(f"Insufficient stock for Barcode '{scanned_barcode}'. Only {current_qty} left.")
+                raise Exception(f"Insufficient stock for Item {prod_id}. Only {current_qty} left.")
 
-            # Calculate line total for this specific item
-            line_total = float(price) * qty_to_sell
-            grand_total += line_total
+            # Calculate raw line total
+            line_total = price * qty_to_sell
+            raw_subtotal += line_total
 
-            # Deduct from Branch Inventory
+            # Deduct from Inventory
             new_qty = current_qty - qty_to_sell
             if new_qty > 0:
                 cur.execute("UPDATE BRANCH_INVENTORY SET quantity_on_hand = %s WHERE inventory_id = %s", (new_qty, inv_id))
             else:
                 cur.execute("DELETE FROM BRANCH_INVENTORY WHERE inventory_id = %s", (inv_id,))
 
-            # Deduct from Global Total
             cur.execute("UPDATE PRODUCTS SET total_stock_quantity = total_stock_quantity - %s WHERE product_id = %s", (qty_to_sell, prod_id))
 
-            # Record in SALES_DETAILS (Line Items)
             cur.execute("""
                 INSERT INTO SALES_DETAILS (sale_id, inventory_id, quantity_sold, price_at_sale, discount_applied)
                 VALUES (%s, %s, %s, %s, 0.00)
             """, (sale_id, inv_id, qty_to_sell, price))
 
-        # 4. UPDATE THE GRAND TOTAL ON THE HEADER
-        cur.execute("UPDATE SALES_HEADERS SET total_amount = %s WHERE sale_id = %s", (grand_total, sale_id))
+        # 4. COMPUTE VAT AND DISCOUNTS
+        if customer_type in ['SENIOR', 'PWD']:
+            # VAT Exempt Math: Remove 12% VAT, then calculate 20% discount
+            vat_exempt_sales = raw_subtotal / 1.12
+            discount_amount = vat_exempt_sales * 0.20
+            grand_total = vat_exempt_sales - discount_amount
+            tax_amount = 0.00
+        else:
+            # Regular Math: VAT is inclusive in the price
+            discount_amount = 0.00
+            grand_total = raw_subtotal
+            # Formula to find how much of the total is VAT: Total - (Total / 1.12)
+            tax_amount = raw_subtotal - (raw_subtotal / 1.12)
+
+        # 5. UPDATE HEADER WITH FINAL CALCULATIONS
+        cur.execute("""
+            UPDATE SALES_HEADERS 
+            SET total_amount = %s, tax_amount = %s, discount_total = %s 
+            WHERE sale_id = %s
+        """, (grand_total, tax_amount, discount_amount, sale_id))
 
         mysql.connection.commit()
         
-        # Output showing the total price prominently
         return jsonify({
             "status": "success",
             "message": "Checkout complete!",
             "receipt_number": sale_id,
             "items_purchased": len(cart),
-            "total_price": round(grand_total, 2)
+            "subtotal": round(raw_subtotal, 2),
+            "discount_applied": round(discount_amount, 2),
+            "vat_amount": round(tax_amount, 2),
+            "total_paid": round(grand_total, 2)
         }), 201
 
     except Exception as e:
@@ -840,20 +865,18 @@ def process_checkout():
     finally:
         cur.close()
 
-
-#  POS - GET RECEIPT BY SALE ID
+# GET RECEIPT BY SALE ID
 
 @app.route('/pos/receipt/<int:sale_id>', methods=['GET'])
 @jwt_required()
 def get_receipt(sale_id):
-    # 1. SECURITY CHECK
     claims = get_jwt()
     if claims.get('role') not in ['admin', 'cashier', 'manager']:
         return jsonify({"message": "Access Denied."}), 403
 
     cur = mysql.connection.cursor()
     try:
-        # 2. FETCH RECEIPT HEADER (Store Info, Cashier, Totals)
+        # Fetch Header, now including tax and discount columns
         header_sql = """
             SELECT 
                 sh.sale_id, 
@@ -862,7 +885,9 @@ def get_receipt(sale_id):
                 sh.payment_method, 
                 sh.customer_type, 
                 u.full_name AS cashier_name, 
-                b.branch_name
+                b.branch_name,
+                sh.tax_amount,
+                sh.discount_total
             FROM SALES_HEADERS sh
             JOIN USERS u ON sh.user_id = u.user_id
             JOIN BRANCHES b ON sh.branch_id = b.branch_id
@@ -874,7 +899,7 @@ def get_receipt(sale_id):
         if not header:
             return jsonify({"message": f"Receipt #{sale_id} not found."}), 404
 
-        # 3. FETCH RECEIPT ITEMS (The individual products bought)
+        # Fetch Items
         items_sql = """
             SELECT 
                 p.product_name_official, 
@@ -889,26 +914,33 @@ def get_receipt(sale_id):
         cur.execute(items_sql, (sale_id,))
         items = cur.fetchall()
 
-        # 4. FORMAT THE OUTPUT FOR THE FRONTEND PRINTER
         item_list = []
+        raw_subtotal = 0.0
         for item in items:
+            line_total = float(item[3])
+            raw_subtotal += line_total
             item_list.append({
                 "product_name": item[0],
                 "qty": item[1],
                 "unit_price": float(item[2]),
-                "subtotal": float(item[3])
+                "subtotal": line_total
             })
 
         receipt_data = {
             "store_name": "Knopper Pharmacy",
             "branch": header[6],
-            "receipt_number": f"INV-{header[0]:06d}", # Formats as INV-000001
+            "receipt_number": f"INV-{header[0]:06d}", 
             "date": header[1].strftime('%Y-%m-%d %H:%M:%S'),
             "cashier": header[5],
             "customer_type": header[4],
             "payment_method": header[3],
             "items": item_list,
-            "grand_total": float(header[2])
+            "financials": {
+                "subtotal": round(raw_subtotal, 2),
+                "vat_amount": round(float(header[7]), 2),
+                "discount_amount": round(float(header[8]), 2),
+                "grand_total": round(float(header[2]), 2)
+            }
         }
 
         return jsonify(receipt_data), 200
