@@ -971,7 +971,8 @@ def get_receipt(sale_id):
 
 
 #  SHOW DAILY SALES REPORT
-
+#https://web-production-2c7737.up.railway.app/pos/daily-sales?date=2026-03-08   replace with date you want to view
+#if no date is provided it will default to current date
 @app.route('/pos/daily-sales', methods=['GET'])
 @jwt_required()
 def get_daily_sales():
