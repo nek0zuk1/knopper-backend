@@ -4,7 +4,6 @@ import os
 from flask import Flask
 from datetime import timedelta
 from dotenv import load_dotenv
-
 from extensions import mysql, bcrypt, jwt
 from user import user_bp
 from inventory import inventory_bp
