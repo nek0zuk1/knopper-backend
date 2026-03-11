@@ -35,10 +35,8 @@ def process_checkout():
         active_shift = cur.fetchone()
         
         if not active_shift:
-            return jsonify({
-                "message": f"DEBUG INFO: Flask thinks your user_id is {current_user_id}. No open shift found for this specific user."
-            }), 403
-        
+            return jsonify({"message": "You must open a shift before processing sales."}), 403
+            
         current_shift_id = active_shift[0]
 
         sale_date = datetime.now()
