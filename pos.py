@@ -378,3 +378,109 @@ def get_daily_sales():
         return jsonify({"error": str(e)}), 500
     finally:
         cur.close()
+
+#SHIFT MANAGEMENT - OPEN SHIFT
+@pos_bp.route('/pos/shift/open', methods=['POST'])
+@jwt_required()
+def open_shift():
+    user_id = get_jwt_identity()
+    claims = get_jwt()
+    branch_id = claims['branch']
+    
+    data = request.json
+    # How much cash (change) is in the drawer before they scan anything?
+    starting_cash = float(data.get('starting_cash', 0.00))
+
+    cur = mysql.connection.cursor()
+    try:
+        # 1. SECURITY CHECK: Ensure they don't already have an open shift
+        cur.execute("SELECT shift_id FROM CASHIER_SHIFTS WHERE user_id = %s AND status = 'OPEN'", (user_id,))
+        if cur.fetchone():
+            return jsonify({"message": "You already have an open shift! Please close it before opening a new one."}), 400
+
+        # 2. OPEN THE SHIFT
+        cur.execute("""
+            INSERT INTO CASHIER_SHIFTS (user_id, branch_id, start_time, starting_cash, status)
+            VALUES (%s, %s, NOW(), %s, 'OPEN')
+        """, (user_id, branch_id, starting_cash))
+        
+        shift_id = cur.lastrowid
+        mysql.connection.commit()
+        
+        return jsonify({
+            "status": "success",
+            "message": "Shift opened successfully! You can now process sales.",
+            "shift_id": shift_id,
+            "starting_cash": starting_cash
+        }), 201
+
+    except Exception as e:
+        mysql.connection.rollback()
+        return jsonify({"error": str(e)}), 500
+    finally:
+        cur.close()
+
+
+#SHIFT MANAGEMENT - CLOSE SHIFT
+
+@pos_bp.route('/pos/shift/close', methods=['POST'])
+@jwt_required()
+def close_shift():
+    user_id = get_jwt_identity()
+    data = request.json
+    
+    # The cashier counts the physical money in the drawer and types it in here
+    actual_cash = float(data.get('actual_cash', 0.00))
+
+    cur = mysql.connection.cursor()
+    try:
+        # 1. FIND THE ACTIVE SHIFT
+        cur.execute("SELECT shift_id, starting_cash FROM CASHIER_SHIFTS WHERE user_id = %s AND status = 'OPEN'", (user_id,))
+        shift = cur.fetchone()
+        
+        if not shift:
+            return jsonify({"message": "No open shift found. You must open a shift first."}), 404
+            
+        shift_id = shift[0]
+        starting_cash = float(shift[1])
+
+        # 2. CALCULATE EXPECTED CASH
+        # We only sum 'CASH' payments. GCash and Cards don't go in the physical drawer!
+        cur.execute("""
+            SELECT IFNULL(SUM(total_amount), 0) 
+            FROM SALES_HEADERS 
+            WHERE shift_id = %s AND payment_method = 'CASH' AND customer_type != 'VOIDED'
+        """, (shift_id,))
+        
+        total_cash_sales = float(cur.fetchone()[0])
+        
+        expected_cash = starting_cash + total_cash_sales
+        discrepancy = actual_cash - expected_cash
+
+        # 3. CLOSE THE SHIFT AND SAVE THE Z-READING
+        cur.execute("""
+            UPDATE CASHIER_SHIFTS 
+            SET end_time = NOW(), expected_cash = %s, actual_cash = %s, discrepancy = %s, status = 'CLOSED'
+            WHERE shift_id = %s
+        """, (expected_cash, actual_cash, discrepancy, shift_id))
+        
+        mysql.connection.commit()
+        
+        return jsonify({
+            "status": "success",
+            "message": "Shift closed and Z-Reading generated!",
+            "shift_id": shift_id,
+            "summary": {
+                "starting_cash": starting_cash,
+                "cash_sales": total_cash_sales,
+                "expected_cash_in_drawer": expected_cash,
+                "actual_cash_counted": actual_cash,
+                "discrepancy": round(discrepancy, 2)
+            }
+        }), 200
+
+    except Exception as e:
+        mysql.connection.rollback()
+        return jsonify({"error": str(e)}), 500
+    finally:
+        cur.close()
