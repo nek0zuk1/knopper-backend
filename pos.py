@@ -309,7 +309,7 @@ def void_transaction(sale_id):
         cur.close()
 
 
-
+#
 
 #  SHOW DAILY SALES REPORT
 #https://web-production-2c7737.up.railway.app/pos/daily-sales?date=2026-03-08   replace with date you want to view
