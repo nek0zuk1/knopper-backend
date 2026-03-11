@@ -11,7 +11,7 @@ pos_bp = Blueprint('pos', __name__)
 @pos_bp.route('/pos/checkout', methods=['POST'])
 @jwt_required()
 def process_checkout():
-    current_user_id = get_jwt_identity()
+    current_user_id = int(get_jwt_identity()) 
     claims = get_jwt()
     current_branch_id = claims['branch']
 
@@ -390,7 +390,7 @@ def get_daily_sales():
 @pos_bp.route('/pos/shift/open', methods=['POST'])
 @jwt_required()
 def open_shift():
-    user_id = get_jwt_identity()
+    user_id = int(get_jwt_identity()) 
     claims = get_jwt()
     branch_id = claims['branch']
     
