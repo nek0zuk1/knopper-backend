@@ -414,7 +414,7 @@ def open_shift():
 
         cur.execute("SELECT shift_id FROM CASHIER_SHIFTS WHERE user_id = %s AND status = 'OPEN'", (user_id,))
         if cur.fetchone():
-            return jsonify({"message": "You already have an open shift! Please close it before opening a new one."}), 400
+            return jsonify({"message": "You already have an open shift! Please close the current shift before opening a new one."}), 400
 
         cur.execute("""
             INSERT INTO CASHIER_SHIFTS (user_id, branch_id, start_time, starting_cash, status)
@@ -442,16 +442,20 @@ def open_shift():
 @pos_bp.route('/pos/shift/close', methods=['POST'])
 @jwt_required()
 def close_shift():
-    user_id = get_jwt_identity()
+    # 1. Get the current logged-in user (The one closing the shift)
+    user_id = int(get_jwt_identity()) 
     data = request.json
-    
-    # The cashier counts the physical money in the drawer and types it in here
     actual_cash = float(data.get('actual_cash', 0.00))
 
     cur = mysql.connection.cursor()
     try:
-        # 1. FIND THE ACTIVE SHIFT
-        cur.execute("SELECT shift_id, starting_cash FROM CASHIER_SHIFTS WHERE user_id = %s AND status = 'OPEN'", (user_id,))
+        # 2. FIND THE ACTIVE SHIFT + JOIN USERS to get the Name
+        cur.execute("""
+            SELECT s.shift_id, s.starting_cash, s.start_time, u.username 
+            FROM CASHIER_SHIFTS s
+            JOIN USERS u ON s.user_id = u.user_id
+            WHERE s.user_id = %s AND s.status = 'OPEN'
+        """, (user_id,))
         shift = cur.fetchone()
         
         if not shift:
@@ -459,9 +463,10 @@ def close_shift():
             
         shift_id = shift[0]
         starting_cash = float(shift[1])
+        start_time = shift[2]
+        opener_username = shift[3]
 
-        # 2. CALCULATE EXPECTED CASH
-        # We only sum 'CASH' payments. GCash and Cards don't go in the physical drawer!
+        # 3. CALCULATE EXPECTED CASH (Only 'CASH' payments)
         cur.execute("""
             SELECT IFNULL(SUM(total_amount), 0) 
             FROM SALES_HEADERS 
@@ -472,21 +477,28 @@ def close_shift():
         
         expected_cash = starting_cash + total_cash_sales
         discrepancy = actual_cash - expected_cash
+        close_time = datetime.now()
 
-        # 3. CLOSE THE SHIFT AND SAVE THE Z-READING
+        # 4. CLOSE THE SHIFT
         cur.execute("""
             UPDATE CASHIER_SHIFTS 
-            SET end_time = NOW(), expected_cash = %s, actual_cash = %s, discrepancy = %s, status = 'CLOSED'
+            SET end_time = %s, expected_cash = %s, actual_cash = %s, discrepancy = %s, status = 'CLOSED'
             WHERE shift_id = %s
-        """, (expected_cash, actual_cash, discrepancy, shift_id))
+        """, (close_time, expected_cash, actual_cash, discrepancy, shift_id))
         
         mysql.connection.commit()
         
         return jsonify({
             "status": "success",
             "message": "Shift closed and Z-Reading generated!",
-            "shift_id": shift_id,
-            "summary": {
+            "shift_details": {
+                "shift_id": shift_id,
+                "opened_by": opener_username,
+                "closed_by": opener_username, # Usually the same person
+                "start_time": start_time.strftime('%Y-%m-%d %H:%M:%S'),
+                "end_time": close_time.strftime('%Y-%m-%d %H:%M:%S')
+            },
+            "financial_summary": {
                 "starting_cash": starting_cash,
                 "cash_sales": total_cash_sales,
                 "expected_cash_in_drawer": expected_cash,
