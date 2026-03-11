@@ -6,15 +6,13 @@ from extensions import mysql, bcrypt
 user_bp = Blueprint('user', __name__)
 
 
-# ROUTE: CREATE USER 
+# CREATE USER 
 @user_bp.route('/create-user', methods=['POST'])
 @jwt_required()
 def create_user():
-    # --- 1. GET ROLE OF CURRENT USER ---
     claims = get_jwt()
     current_role = claims['role']
 
-    # --- 2. GET DATA FROM POSTMAN ---
     data = request.json
     target_role = data.get('role')
     u_id = data.get('user_id')
@@ -23,13 +21,11 @@ def create_user():
     fname = data.get('full_name')
     pwd = data.get('password')
 
-    # --- 3. STRICT VALIDATION: Check for missing or empty fields ---
     if not all([u_id, b_id, uname, fname, pwd, target_role]):
         return jsonify({
             "message": "Validation Error: All fields (user_id, branch_id, username, password, full_name, role) are required and cannot be empty."
         }), 400
 
-    # --- 4. ROLE LOGIC ---
     if current_role == 'staff':
         return jsonify({"message": "Access Denied: Staff cannot create accounts"}), 403
     
@@ -38,7 +34,7 @@ def create_user():
 
     cur = mysql.connection.cursor()
     try:
-        # --- 5. DUPLICATE CHECK: Look for existing ID, Username, or Name IN THE SAME BRANCH ---
+        # --- DUPLICATE CHECK: Look for existing ID, Username, or Name IN THE SAME BRANCH ---
         cur.execute("""
             SELECT user_id, username, full_name, branch_id 
             FROM USERS 
@@ -49,7 +45,6 @@ def create_user():
         
         existing_user = cur.fetchone()
         
-        # If a match is found, check exactly what triggered it
         if existing_user:
             if existing_user[0] == int(u_id):
                 return jsonify({"message": f"Conflict: The user_id '{u_id}' is already in use."}), 409
@@ -57,14 +52,11 @@ def create_user():
             if existing_user[1] == uname:
                 return jsonify({"message": f"Conflict: The username '{uname}' is already taken. Please choose another."}), 409
             
-            # Check if the name AND the branch match
             if existing_user[2] == fname and existing_user[3] == int(b_id):
                 return jsonify({"message": f"Conflict: '{fname}' is already registered at Branch {b_id}."}), 409
 
-        # --- 6. HASH PASSWORD & INSERT TO DATABASE ---
         hashed_pwd = bcrypt.generate_password_hash(pwd).decode('utf-8')
 
-        # Added 'is_active' and 'TRUE' to the SQL command
         cur.execute("""
             INSERT INTO USERS (user_id, branch_id, username, password_hash, full_name, role, is_active)
             VALUES (%s, %s, %s, %s, %s, %s, TRUE)
@@ -142,13 +134,12 @@ def get_branch_info(branch_id):
 #  SETUP ADMIN 
 @user_bp.route('/setup-admin', methods=['POST'])
 def setup_admin():
-    # 1. SECURITY CHECK: Check for the secret header
+    # SECURITY CHECK: Check for the secret header
     setup_key = request.headers.get('X-Setup-Key')
     
     if setup_key != "Knopper-Init-2026":
         return jsonify({"message": "Forbidden: Invalid Setup Key"}), 403
 
-    # 2. CREATE ADMIN LOGIC
     data = request.json
     
     if not data or not data.get('password'):
@@ -175,7 +166,7 @@ def setup_admin():
 @user_bp.route('/users', methods=['GET'])
 @jwt_required()
 def get_all_users():
-    # Check if the requester is an Admin/Manager if you want to restrict this
+
     claims = get_jwt()
     if claims['role'] not in ['admin', 'manager']:
         return jsonify({"message": "Access Denied"}), 403
@@ -211,7 +202,7 @@ def get_all_users():
 @user_bp.route('/update-users/<int:target_user_id>', methods=['PUT'])
 @jwt_required()
 def edit_user(target_user_id):
-    # 1. STRICT SECURITY CHECK: Only Admins allowed
+
     claims = get_jwt()
     if claims.get('role') != 'admin':
         return jsonify({"message": "Access Denied: Only Administrators can edit user profiles."}), 403
@@ -229,12 +220,12 @@ def edit_user(target_user_id):
 
     cur = mysql.connection.cursor()
     try:
-        # 3. VERIFY USER EXISTS
+        # VERIFY USER EXISTS
         cur.execute("SELECT * FROM USERS WHERE user_id = %s", (target_user_id,))
         if not cur.fetchone():
             return jsonify({"message": f"User ID {target_user_id} not found."}), 404
 
-        # 4. DUPLICATE CHECK (Exclude the current user we are editing)
+        # 4. DUPLICATE CHECK 
         if username or (full_name and branch_id):
             cur.execute("""
                 SELECT user_id, username, full_name, branch_id 
@@ -250,7 +241,7 @@ def edit_user(target_user_id):
                 if conflict[2] == full_name and conflict[3] == int(branch_id):
                     return jsonify({"message": f"Conflict: '{full_name}' already exists in Branch {branch_id}."}), 409
 
-        # 5. DYNAMICALLY BUILD THE UPDATE QUERY
+    
         update_fields = []
         update_values = []
 
@@ -266,7 +257,7 @@ def edit_user(target_user_id):
         if branch_id:
             update_fields.append("branch_id = %s")
             update_values.append(branch_id)
-        if is_active is not None:  # is_active could be False, so we check 'is not None'
+        if is_active is not None:  
             update_fields.append("is_active = %s")
             update_values.append(is_active)
         if password:
@@ -277,7 +268,7 @@ def edit_user(target_user_id):
         if not update_fields:
             return jsonify({"message": "No valid fields provided to update."}), 400
 
-        # Add the target_user_id to the very end of our values list for the WHERE clause
+    
         update_values.append(target_user_id)
 
         # Assemble the final SQL string
