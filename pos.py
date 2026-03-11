@@ -394,18 +394,28 @@ def open_shift():
     claims = get_jwt()
     branch_id = claims['branch']
     
+    if claims.get('role') != 'cashier':
+        return jsonify({"message": "Access Denied: Only cashiers can open a register shift."}), 403
+    
     data = request.json
-    # How much cash (change) is in the drawer before they scan anything?
     starting_cash = float(data.get('starting_cash', 0.00))
+    provided_password = data.get('password')
+
+    if not provided_password:
+        return jsonify({"message": "Security Verification: Please provide your password to open the shift."}), 400
 
     cur = mysql.connection.cursor()
     try:
-        # 1. SECURITY CHECK: Ensure they don't already have an open shift
+        cur.execute("SELECT password_hash FROM USERS WHERE user_id = %s", (user_id,))
+        user_record = cur.fetchone()
+
+        if not user_record or not bcrypt.check_password_hash(user_record[0], provided_password):
+            return jsonify({"message": "Verification Failed: Incorrect password."}), 401
+
         cur.execute("SELECT shift_id FROM CASHIER_SHIFTS WHERE user_id = %s AND status = 'OPEN'", (user_id,))
         if cur.fetchone():
             return jsonify({"message": "You already have an open shift! Please close it before opening a new one."}), 400
 
-        # 2. OPEN THE SHIFT
         cur.execute("""
             INSERT INTO CASHIER_SHIFTS (user_id, branch_id, start_time, starting_cash, status)
             VALUES (%s, %s, NOW(), %s, 'OPEN')
@@ -416,7 +426,7 @@ def open_shift():
         
         return jsonify({
             "status": "success",
-            "message": "Shift opened successfully! You can now process sales.",
+            "message": "Identity verified. Shift opened successfully!",
             "shift_id": shift_id,
             "starting_cash": starting_cash
         }), 201
@@ -426,7 +436,6 @@ def open_shift():
         return jsonify({"error": str(e)}), 500
     finally:
         cur.close()
-
 
 #SHIFT MANAGEMENT - CLOSE SHIFT
 
