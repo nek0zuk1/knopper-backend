@@ -10,7 +10,7 @@ from user import user_bp
 from inventory import inventory_bp
 from pos import pos_bp
 from procurement import procurement_bp
-from flask_cors import  CORS
+from flask_cors import CORS
 load_dotenv()
 
 app = Flask(__name__)
