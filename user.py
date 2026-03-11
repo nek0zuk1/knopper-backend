@@ -1,10 +1,11 @@
 from flask import Blueprint, request, jsonify
 from flask_jwt_extended import jwt_required, get_jwt_identity, get_jwt, create_access_token
 from extensions import mysql, bcrypt
+from flask_cors import COR
 
 # Define the blueprint
 user_bp = Blueprint('user', __name__)
-
+CORS(app)
 
 # CREATE USER 
 @user_bp.route('/create-user', methods=['POST'])
