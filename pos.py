@@ -2,7 +2,7 @@ from flask import Blueprint, request, jsonify
 from flask_jwt_extended import jwt_required, get_jwt_identity, get_jwt
 from datetime import datetime
 from extensions import mysql
-
+from extensions import mysql, bcrypt, jwt
 pos_bp = Blueprint('pos', __name__)
 
 
@@ -235,6 +235,80 @@ def get_receipt(sale_id):
         return jsonify({"error": str(e)}), 500
     finally:
         cur.close()
+
+#void transaction
+@pos_bp.route('/pos/void/<int:sale_id>', methods=['POST'])
+@jwt_required()
+def void_transaction(sale_id):
+    cashier_id = get_jwt_identity()
+
+    #maneger credential is required to void a transaction
+    data = request.json
+    mgr_username = data.get('manager_username')
+    mgr_password = data.get('manager_password')
+
+    if not mgr_username or not mgr_password:
+        return jsonify({"message": "Manager override credentials are required."}), 400
+
+    cur = mysql.connection.cursor()
+    try:
+        cur.execute("SELECT user_id, password_hash, role, is_active FROM USERS WHERE username = %s", (mgr_username,))
+        manager = cur.fetchone()
+
+        if not manager or not bcrypt.check_password_hash(manager[1], mgr_password):
+            return jsonify({"message": "Override Failed: Invalid Manager Credentials."}), 401
+        
+        if manager[2] not in ['admin', 'manager']:
+            return jsonify({"message": "Override Denied: User is not an admin or manager."}), 403
+            
+        if not manager[3]:
+            return jsonify({"message": "Override Denied: Manager account is currently inactive."}), 403
+            
+        manager_id = manager[0]
+
+        cur.execute("SELECT total_amount, payment_method FROM SALES_HEADERS WHERE sale_id = %s", (sale_id,))
+        sale = cur.fetchone()
+        
+        if not sale:
+            return jsonify({"message": "Receipt not found."}), 404
+            
+        if float(sale[0]) <= 0:
+            return jsonify({"message": "This transaction has already been voided."}), 400
+
+        cur.execute("SELECT inventory_id, quantity_sold, product_id FROM SALES_DETAILS WHERE sale_id = %s", (sale_id,))
+        items = cur.fetchall()
+
+        for item in items:
+            inv_id, qty_sold, prod_id = item[0], item[1], item[2]
+            
+            cur.execute("UPDATE BRANCH_INVENTORY SET quantity_on_hand = quantity_on_hand + %s WHERE inventory_id = %s", (qty_sold, inv_id))
+            cur.execute("UPDATE PRODUCTS SET total_stock_quantity = total_stock_quantity + %s WHERE product_id = %s", (qty_sold, prod_id))
+
+            cur.execute("""
+                INSERT INTO STOCK_ADJUSTMENTS (inventory_id, user_id, adjustment_type, quantity_adjusted, date_adjusted, remarks)
+                VALUES (%s, %s, 'VOID_RESTORE', %s, %s, %s)
+            """, (inv_id, manager_id, qty_sold, datetime.now(), f"Manager Override: Voided Sale #{sale_id}"))
+
+        cur.execute("""
+            UPDATE SALES_HEADERS 
+            SET total_amount = 0, tax_amount = 0, discount_total = 0, customer_type = 'VOIDED' 
+            WHERE sale_id = %s
+        """, (sale_id,))
+
+        mysql.connection.commit()
+        return jsonify({
+            "status": "success",
+            "message": f"Receipt #{sale_id} voided successfully.",
+            "authorized_by": mgr_username
+        }), 200
+
+    except Exception as e:
+        mysql.connection.rollback()
+        return jsonify({"error": str(e)}), 500
+    finally:
+        cur.close()
+
+
 
 
 #  SHOW DAILY SALES REPORT
