@@ -242,7 +242,7 @@ def get_receipt(sale_id):
 def void_transaction(sale_id):
     cashier_id = get_jwt_identity()
 
-    #maneger credential is required to void a transaction
+    # Manager credential is required to void a transaction
     data = request.json
     mgr_username = data.get('manager_username')
     mgr_password = data.get('manager_password')
@@ -275,7 +275,13 @@ def void_transaction(sale_id):
         if float(sale[0]) <= 0:
             return jsonify({"message": "This transaction has already been voided."}), 400
 
-        cur.execute("SELECT inventory_id, quantity_sold, product_id FROM SALES_DETAILS WHERE sale_id = %s", (sale_id,))
+        # --- 3. RETURN INVENTORY TO SHELF ---
+        cur.execute("""
+            SELECT sd.inventory_id, sd.quantity_sold, bi.product_id 
+            FROM SALES_DETAILS sd
+            JOIN BRANCH_INVENTORY bi ON sd.inventory_id = bi.inventory_id
+            WHERE sd.sale_id = %s
+        """, (sale_id,))
         items = cur.fetchall()
 
         for item in items:
@@ -289,9 +295,11 @@ def void_transaction(sale_id):
                 VALUES (%s, %s, 'VOID_RESTORE', %s, %s, %s)
             """, (inv_id, manager_id, qty_sold, datetime.now(), f"Manager Override: Voided Sale #{sale_id}"))
 
+        # --- 4. CROSS OUT THE RECEIPT ---
         cur.execute("""
             UPDATE SALES_HEADERS 
-            SET total_amount = 0, tax_amount = 0, discount_total = 0, customer_type = 'VOIDED' 
+            SET total_amount = 0, tax_amount = 0, discount_total = 0, 
+                amount_tendered = 0, change_due = 0, customer_type = 'VOIDED' 
             WHERE sale_id = %s
         """, (sale_id,))
 
@@ -307,8 +315,6 @@ def void_transaction(sale_id):
         return jsonify({"error": str(e)}), 500
     finally:
         cur.close()
-
-
 #
 
 #  SHOW DAILY SALES REPORT
