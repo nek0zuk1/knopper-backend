@@ -394,9 +394,9 @@ def open_shift():
     claims = get_jwt()
     branch_id = claims['branch']
     
-    if claims.get('role') != 'cashier':
-        return jsonify({"message": "Access Denied: Only cashiers can open a register shift."}), 403
-    
+    if claims.get('role') not in ['admin', 'manager', 'cashier']:
+        return jsonify({"message": "Access Denied: Only authorized staff can open a shift."}), 403
+     
     data = request.json
     starting_cash = float(data.get('starting_cash', 0.00))
     provided_password = data.get('password')
