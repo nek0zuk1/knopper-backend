@@ -491,19 +491,17 @@ def close_shift():
         return jsonify({
             "status": "success",
             "message": "Shift closed and Z-Reading generated!",
-            "shift_details": {
-                "shift_id": shift_id,
-                "opened_by": opener_username,
-                "closed_by": opener_username, # Usually the same person
-                "start_time": start_time.strftime('%Y-%m-%d %H:%M:%S'),
-                "end_time": close_time.strftime('%Y-%m-%d %H:%M:%S')
-            },
+           
             "financial_summary": {
+                "opened_by": opener_username,
                 "starting_cash": starting_cash,
                 "cash_sales": total_cash_sales,
                 "expected_cash_in_drawer": expected_cash,
                 "actual_cash_counted": actual_cash,
-                "discrepancy": round(discrepancy, 2)
+                "discrepancy": round(discrepancy, 2),
+                "start_time": start_time.strftime('%Y-%m-%d %H:%M:%S'),
+                "end_time": close_time.strftime('%Y-%m-%d %H:%M:%S')
+                
             }
         }), 200
 
