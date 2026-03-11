@@ -30,12 +30,20 @@ def process_checkout():
 
     cur = mysql.connection.cursor()
     try:
-        # 1. CREATE SALES HEADER
+        # GET ACTIVE SHIFT 
+        cur.execute("SELECT shift_id FROM CASHIER_SHIFTS WHERE user_id = %s AND status = 'OPEN'", (current_user_id,))
+        active_shift = cur.fetchone()
+        
+        if not active_shift:
+            return jsonify({"message": "You must open a shift before processing sales."}), 403
+            
+        current_shift_id = active_shift[0]
+
         sale_date = datetime.now()
         cur.execute("""
-            INSERT INTO SALES_HEADERS (branch_id, user_id, sale_date, total_amount, tax_amount, discount_total, payment_method, customer_type)
-            VALUES (%s, %s, %s, 0.00, 0.00, 0.00, %s, %s)
-        """, (current_branch_id, current_user_id, sale_date, payment_method, customer_type))
+            INSERT INTO SALES_HEADERS (branch_id, user_id, shift_id, sale_date, total_amount, tax_amount, discount_total, payment_method, customer_type)
+            VALUES (%s, %s, %s, %s, 0.00, 0.00, 0.00, %s, %s)
+        """, (current_branch_id, current_user_id, current_shift_id, sale_date, payment_method, customer_type))
         
         sale_id = cur.lastrowid
         
@@ -44,7 +52,6 @@ def process_checkout():
         total_vat = 0.0
         grand_total = 0.0
 
-        # 2. PROCESS EACH  ITEM
         for item in cart:
             scanned_barcode = item.get('barcode') 
             manual_product_id = item.get('product_id')
@@ -77,7 +84,7 @@ def process_checkout():
 
             inv_id, current_qty, price, prod_id = stock_item[0], stock_item[1], float(stock_item[2]), stock_item[3]
 
-            # SAFETY GATE: Prevents negative stock mathematically
+            # Prevents negative stock mathematically
             if qty_to_sell > current_qty:
                 raise Exception(f"Insufficient stock for Item {prod_id}. Only {current_qty} left.")
 
@@ -101,7 +108,6 @@ def process_checkout():
             total_vat += item_vat
             grand_total += item_payable
 
-    
             new_qty = current_qty - qty_to_sell
             cur.execute("UPDATE BRANCH_INVENTORY SET quantity_on_hand = %s WHERE inventory_id = %s", (new_qty, inv_id))
 
@@ -145,6 +151,7 @@ def process_checkout():
         return jsonify({"error": str(e)}), 400
     finally:
         cur.close()
+
 # GET RECEIPT BY SALE ID
 
 @pos_bp.route('/pos/receipt/<int:sale_id>', methods=['GET'])
