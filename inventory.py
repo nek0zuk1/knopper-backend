@@ -130,7 +130,6 @@ def add_product_to_shelf():
         remarks = f"add supply in gandola {gondola_code}"
         cur.execute(sql_audit, (inventory_id, current_user_id, quantity, datetime.now(), remarks))
 
-        # 3. Update Global Total
         cur.execute("UPDATE PRODUCTS SET total_stock_quantity = IFNULL(total_stock_quantity, 0) + %s WHERE product_id = %s", (quantity, product_id))
 
         mysql.connection.commit()
