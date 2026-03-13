@@ -830,7 +830,6 @@ def get_shift_history():
     claims = get_jwt()
     current_branch_id = claims['branch']
     
-    # Optional: You might want to restrict this to just 'admin' and 'manager'
     if claims.get('role') not in ['admin', 'manager']:
         return jsonify({"message": "Access Denied."}), 403
 
@@ -888,7 +887,6 @@ def get_shift_sales(target_shift_id):
 
     cur = mysql.connection.cursor()
     try:
-        # 1. GET SHIFT DETAILS
         cur.execute("""
             SELECT cs.user_id, cs.start_time, cs.end_time, cs.status, u.username, 
                    cs.starting_cash, cs.expected_cash, cs.actual_cash, cs.discrepancy
@@ -908,10 +906,8 @@ def get_shift_sales(target_shift_id):
         shift_status = shift_info[3]
         cashier_name = shift_info[4]
         
-        # If the shift is still open, we calculate refunds up to 'NOW()'
         calc_end_time = end_time if end_time else datetime.now()
 
-        # 2. GET GROSS SALES FOR THIS SHIFT
         cur.execute("""
             SELECT 
                 COUNT(sale_id) AS total_transactions,
@@ -928,8 +924,6 @@ def get_shift_sales(target_shift_id):
         total_vat = float(summary[2])
         total_discounts = float(summary[3])
 
-        # 3. GET REFUNDS DURING THIS SHIFT
-        # We check refunds processed by this user between their shift start and end times
         cur.execute("""
             SELECT 
                 COUNT(return_id) AS total_refund_transactions,
@@ -944,7 +938,6 @@ def get_shift_sales(target_shift_id):
 
         net_revenue = gross_revenue - total_refunds
 
-        # 4. PAYMENT BREAKDOWN FOR THIS SHIFT
         cur.execute("""
             SELECT payment_method, IFNULL(SUM(total_amount), 0) 
             FROM SALES_HEADERS
