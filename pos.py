@@ -4,7 +4,7 @@ from datetime import datetime
 from extensions import mysql
 from extensions import mysql, bcrypt, jwt
 pos_bp = Blueprint('pos', __name__)
-
+import json
 
 
 # POS - PROCESS SALE 
@@ -500,4 +500,119 @@ def close_shift():
     finally:
         cur.close()
 
+# suspend transaction 
+
+@pos_bp.route('/pos/suspend', methods=['POST'])
+@jwt_required()
+def suspend_transaction():
+    user_id = int(get_jwt_identity())
+    claims = get_jwt()
+    branch_id = claims['branch']
+
+    data = request.json
+    cart = data.get('cart')
+    # Optional note to help cashier remember who the cart belongs to
+    reference_note = data.get('reference_note', 'Waiting Customer') 
+
+    if not cart or not isinstance(cart, list) or len(cart) == 0:
+        return jsonify({"message": "Cannot suspend an empty cart."}), 400
+
+    # Convert the Python list (cart) into a JSON string to store in the database
+    cart_json = json.dumps(cart)
+
+    cur = mysql.connection.cursor()
+    try:
+        cur.execute("""
+            INSERT INTO SUSPENDED_TRANSACTIONS (branch_id, user_id, reference_note, cart_data)
+            VALUES (%s, %s, %s, %s)
+        """, (branch_id, user_id, reference_note, cart_json))
+        
+        suspend_id = cur.lastrowid
+        mysql.connection.commit()
+        
+        return jsonify({
+            "status": "success", 
+            "message": "Transaction suspended successfully. Screen cleared.",
+            "suspend_id": suspend_id
+        }), 201
+        
+    except Exception as e:
+        mysql.connection.rollback()
+        return jsonify({"error": str(e)}), 500
+    finally:
+        cur.close()
+
+
+#view suspended transactions 
+@pos_bp.route('/pos/suspended-list', methods=['GET'])
+@jwt_required()
+def get_suspended_list():
+    claims = get_jwt()
+    branch_id = claims['branch']
+
+    cur = mysql.connection.cursor()
+    try:
+        # Show all parked carts for this specific branch
+        cur.execute("""
+            SELECT st.suspend_id, st.reference_note, st.created_at, u.username
+            FROM SUSPENDED_TRANSACTIONS st
+            JOIN USERS u ON st.user_id = u.user_id
+            WHERE st.branch_id = %s
+            ORDER BY st.created_at ASC
+        """, (branch_id,))
+        results = cur.fetchall()
+
+        suspended_list = []
+        for row in results:
+            suspended_list.append({
+                "suspend_id": row[0],
+                "reference_note": row[1],
+                "time_suspended": row[2].strftime('%I:%M %p'),
+                "cashier": row[3]
+            })
+            
+        return jsonify(suspended_list), 200
+        
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+    finally:
+        cur.close() 
+
+#resume transaction 
+
+@pos_bp.route('/pos/resume/<int:suspend_id>', methods=['POST'])
+@jwt_required()
+def resume_transaction(suspend_id):
+    claims = get_jwt()
+    branch_id = claims['branch']
+
+    cur = mysql.connection.cursor()
+    try:
+        cur.execute("SELECT cart_data FROM SUSPENDED_TRANSACTIONS WHERE suspend_id = %s AND branch_id = %s", (suspend_id, branch_id))
+        result = cur.fetchone()
+
+        if not result:
+            return jsonify({"message": "Suspended transaction not found."}), 404
+
+        cart_data = json.loads(result[0])
+
+        cur.execute("DELETE FROM SUSPENDED_TRANSACTIONS WHERE suspend_id = %s", (suspend_id,))
+        mysql.connection.commit()
+
+        return jsonify({
+            "status": "success",
+            "message": "Transaction resumed and loaded to register.",
+            "cart": cart_data
+        }), 200
+        
+    except Exception as e:
+        mysql.connection.rollback()
+        return jsonify({"error": str(e)}), 500
+    finally:
+        cur.close()
+
+
+
+
 # refund/return 
+
