@@ -437,19 +437,16 @@ def open_shift():
         cur.close()
 
 #SHIFT MANAGEMENT - CLOSE SHIFT
-
 @pos_bp.route('/pos/shift/close', methods=['POST'])
 @jwt_required()
 def close_shift():
-    user_id = get_jwt_identity()
+    user_id = int(get_jwt_identity())
     data = request.json
     
-    # The cashier counts the physical money in the drawer and types it in here
     actual_cash = float(data.get('actual_cash', 0.00))
 
     cur = mysql.connection.cursor()
     try:
-        # 1. FIND THE ACTIVE SHIFT
         cur.execute("SELECT shift_id, starting_cash FROM CASHIER_SHIFTS WHERE user_id = %s AND status = 'OPEN'", (user_id,))
         shift = cur.fetchone()
         
@@ -459,8 +456,6 @@ def close_shift():
         shift_id = shift[0]
         starting_cash = float(shift[1])
 
-        # 2. CALCULATE EXPECTED CASH
-        # We only sum 'CASH' payments. GCash and Cards don't go in the physical drawer!
         cur.execute("""
             SELECT IFNULL(SUM(total_amount), 0) 
             FROM SALES_HEADERS 
@@ -472,13 +467,17 @@ def close_shift():
         expected_cash = starting_cash + total_cash_sales
         discrepancy = actual_cash - expected_cash
 
-        # 3. CLOSE THE SHIFT AND SAVE THE Z-READING
         cur.execute("""
             UPDATE CASHIER_SHIFTS 
             SET end_time = NOW(), expected_cash = %s, actual_cash = %s, discrepancy = %s, status = 'CLOSED'
             WHERE shift_id = %s
         """, (expected_cash, actual_cash, discrepancy, shift_id))
         
+        #  CLEAN UP ABANDONED SUSPENDED TRANSACTIONS ---
+        # Deletes any parked carts that this specific cashier forgot to resume
+        cur.execute("DELETE FROM SUSPENDED_TRANSACTIONS WHERE user_id = %s", (user_id,))
+        cleared_carts = cur.rowcount 
+
         mysql.connection.commit()
         
         return jsonify({
@@ -490,7 +489,8 @@ def close_shift():
                 "cash_sales": total_cash_sales,
                 "expected_cash_in_drawer": expected_cash,
                 "actual_cash_counted": actual_cash,
-                "discrepancy": round(discrepancy, 2)
+                "discrepancy": round(discrepancy, 2),
+                "abandoned_carts_cleared": cleared_carts 
             }
         }), 200
 
@@ -517,7 +517,6 @@ def suspend_transaction():
     if not cart or not isinstance(cart, list) or len(cart) == 0:
         return jsonify({"message": "Cannot suspend an empty cart."}), 400
 
-    # Convert the Python list (cart) into a JSON string to store in the database
     cart_json = json.dumps(cart)
 
     cur = mysql.connection.cursor()
@@ -532,7 +531,7 @@ def suspend_transaction():
         
         return jsonify({
             "status": "success", 
-            "message": "Transaction suspended successfully. Screen cleared.",
+            "message": "Transaction suspended successfully.",
             "suspend_id": suspend_id
         }), 201
         
@@ -552,7 +551,6 @@ def get_suspended_list():
 
     cur = mysql.connection.cursor()
     try:
-        # Show all parked carts for this specific branch
         cur.execute("""
             SELECT st.suspend_id, st.reference_note, st.created_at, u.username
             FROM SUSPENDED_TRANSACTIONS st
