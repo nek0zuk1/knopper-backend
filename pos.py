@@ -822,3 +822,170 @@ def get_daily_sales():
         return jsonify({"error": str(e)}), 500
     finally:
         cur.close()
+
+#view all shift 
+@pos_bp.route('/pos/shift-history', methods=['GET'])
+@jwt_required()
+def get_shift_history():
+    claims = get_jwt()
+    current_branch_id = claims['branch']
+    
+    # Optional: You might want to restrict this to just 'admin' and 'manager'
+    if claims.get('role') not in ['admin', 'manager']:
+        return jsonify({"message": "Access Denied."}), 403
+
+    cur = mysql.connection.cursor()
+    try:
+        cur.execute("""
+            SELECT 
+                cs.shift_id, 
+                u.username, 
+                u.full_name,
+                cs.start_time, 
+                cs.end_time, 
+                cs.status
+            FROM CASHIER_SHIFTS cs
+            JOIN USERS u ON cs.user_id = u.user_id
+            WHERE cs.branch_id = %s
+            ORDER BY cs.start_time DESC
+        """, (current_branch_id,))
+        
+        shifts = cur.fetchall()
+        
+        shift_list = []
+        for row in shifts:
+            shift_list.append({
+                "shift_id": row[0],
+                "username": row[1],
+                "full_name": row[2],
+                "start_time": row[3].strftime('%Y-%m-%d %H:%M:%S') if row[3] else None,
+                "end_time": row[4].strftime('%Y-%m-%d %H:%M:%S') if row[4] else "Still Open",
+                "status": row[5]
+            })
+
+        return jsonify({
+            "status": "success",
+            "branch_id": current_branch_id,
+            "total_records": len(shift_list),
+            "shifts": shift_list
+        }), 200
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+    finally:
+        cur.close()
+
+#sales report per shift
+
+@pos_bp.route('/pos/shift-report/<int:target_shift_id>', methods=['GET'])
+@jwt_required()
+def get_shift_sales(target_shift_id):
+    claims = get_jwt()
+    current_branch_id = claims['branch']
+    
+    if claims.get('role') not in ['admin', 'manager', 'cashier']:
+        return jsonify({"message": "Access Denied."}), 403
+
+    cur = mysql.connection.cursor()
+    try:
+        # 1. GET SHIFT DETAILS
+        cur.execute("""
+            SELECT cs.user_id, cs.start_time, cs.end_time, cs.status, u.username, 
+                   cs.starting_cash, cs.expected_cash, cs.actual_cash, cs.discrepancy
+            FROM CASHIER_SHIFTS cs
+            JOIN USERS u ON cs.user_id = u.user_id
+            WHERE cs.shift_id = %s AND cs.branch_id = %s
+        """, (target_shift_id, current_branch_id))
+        
+        shift_info = cur.fetchone()
+        
+        if not shift_info:
+            return jsonify({"message": f"Shift #{target_shift_id} not found in this branch."}), 404
+            
+        shift_user_id = shift_info[0]
+        start_time = shift_info[1]
+        end_time = shift_info[2]
+        shift_status = shift_info[3]
+        cashier_name = shift_info[4]
+        
+        # If the shift is still open, we calculate refunds up to 'NOW()'
+        calc_end_time = end_time if end_time else datetime.now()
+
+        # 2. GET GROSS SALES FOR THIS SHIFT
+        cur.execute("""
+            SELECT 
+                COUNT(sale_id) AS total_transactions,
+                IFNULL(SUM(total_amount), 0) AS gross_revenue,
+                IFNULL(SUM(tax_amount), 0) AS total_vat,
+                IFNULL(SUM(discount_total), 0) AS total_discounts
+            FROM SALES_HEADERS
+            WHERE shift_id = %s AND customer_type != 'VOIDED'
+        """, (target_shift_id,))
+        
+        summary = cur.fetchone()
+        total_transactions = summary[0]
+        gross_revenue = float(summary[1])
+        total_vat = float(summary[2])
+        total_discounts = float(summary[3])
+
+        # 3. GET REFUNDS DURING THIS SHIFT
+        # We check refunds processed by this user between their shift start and end times
+        cur.execute("""
+            SELECT 
+                COUNT(return_id) AS total_refund_transactions,
+                IFNULL(SUM(total_refund_amount), 0) AS total_refunded_amount
+            FROM SALES_RETURNS
+            WHERE branch_id = %s AND user_id = %s AND return_date >= %s AND return_date <= %s
+        """, (current_branch_id, shift_user_id, start_time, calc_end_time))
+        
+        refund_summary = cur.fetchone()
+        refund_count = refund_summary[0]
+        total_refunds = float(refund_summary[1])
+
+        net_revenue = gross_revenue - total_refunds
+
+        # 4. PAYMENT BREAKDOWN FOR THIS SHIFT
+        cur.execute("""
+            SELECT payment_method, IFNULL(SUM(total_amount), 0) 
+            FROM SALES_HEADERS
+            WHERE shift_id = %s AND customer_type != 'VOIDED'
+            GROUP BY payment_method
+        """, (target_shift_id,))
+        
+        payment_breakdown = cur.fetchall()
+        payments = {}
+        for row in payment_breakdown:
+            payments[row[0]] = round(float(row[1]), 2)
+
+        report = {
+            "shift_details": {
+                "shift_id": target_shift_id,
+                "cashier": cashier_name,
+                "status": shift_status,
+                "opened_at": start_time.strftime('%Y-%m-%d %H:%M:%S'),
+                "closed_at": end_time.strftime('%Y-%m-%d %H:%M:%S') if end_time else "Still Open"
+            },
+            "financial_summary": {
+                "total_transactions": total_transactions,
+                "gross_revenue": round(gross_revenue, 2),
+                "total_refunds_given": round(total_refunds, 2),
+                "net_revenue": round(net_revenue, 2),
+                "total_vat_collected": round(total_vat, 2),
+                "total_discounts_given": round(total_discounts, 2)
+            },
+            "drawer_reconciliation": {
+                "starting_cash": float(shift_info[5]),
+                "expected_cash": float(shift_info[6]) if shift_info[6] else None,
+                "actual_cash": float(shift_info[7]) if shift_info[7] else None,
+                "discrepancy": float(shift_info[8]) if shift_info[8] else None
+            },
+            "payment_breakdown": payments
+        }
+
+        return jsonify(report), 200
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+    finally:
+        cur.close()
+
