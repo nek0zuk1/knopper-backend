@@ -323,67 +323,7 @@ def void_transaction(sale_id):
         cur.close()
 #
 
-#  SHOW DAILY SALES REPORT
-#https://web-production-2c7737.up.railway.app/pos/daily-sales?date=2026-03-08   replace with date you want to view
-#if no date is provided it will default to current date
-@pos_bp.route('/pos/daily-sales', methods=['GET'])
-@jwt_required()
-def get_daily_sales():
-    claims = get_jwt()
-    current_branch_id = claims['branch']
-    
-    if claims.get('role') not in ['admin', 'manager', 'cashier']:
-        return jsonify({"message": "Access Denied."}), 403
 
-    # Accept a date from the URL (e.g., ?date=2026-03-10), otherwise default to today
-    target_date = request.args.get('date', datetime.now().strftime('%Y-%m-%d'))
-
-    cur = mysql.connection.cursor()
-    try:
-        # GET THE GRAND TOTALS FOR THE DAY
-        cur.execute("""
-            SELECT 
-                COUNT(sale_id) AS total_transactions,
-                IFNULL(SUM(total_amount), 0) AS total_revenue,
-                IFNULL(SUM(tax_amount), 0) AS total_vat,
-                IFNULL(SUM(discount_total), 0) AS total_discounts
-            FROM SALES_HEADERS
-            WHERE branch_id = %s AND DATE(sale_date) = %s
-        """, (current_branch_id, target_date))
-        
-        summary = cur.fetchone()
-
-        cur.execute("""
-            SELECT payment_method, IFNULL(SUM(total_amount), 0) 
-            FROM SALES_HEADERS
-            WHERE branch_id = %s AND DATE(sale_date) = %s
-            GROUP BY payment_method
-        """, (current_branch_id, target_date))
-        
-        payment_breakdown = cur.fetchall()
-        
-        payments = {}
-        for row in payment_breakdown:
-            payments[row[0]] = round(float(row[1]), 2)
-
-        report = {
-            "branch_id": current_branch_id,
-            "report_date": target_date,
-            "summary": {
-                "total_transactions": summary[0],
-                "total_revenue": round(float(summary[1]), 2),
-                "total_vat_collected": round(float(summary[2]), 2),
-                "total_discounts_given": round(float(summary[3]), 2)
-            },
-            "payment_breakdown": payments
-        }
-
-        return jsonify(report), 200
-
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-    finally:
-        cur.close()
 
 #SHIFT MANAGEMENT - OPEN SHIFT
 @pos_bp.route('/pos/shift/open', methods=['POST'])
@@ -794,6 +734,89 @@ def lookup_transaction(sale_id):
             },
             "line_items": item_list
         }), 200
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+    finally:
+        cur.close()
+
+# SHOW DAILY SALES REPORT
+# https://web-production-2c7737.up.railway.app/pos/daily-sales?date=2026-03-08
+@pos_bp.route('/pos/daily-sales', methods=['GET'])
+@jwt_required()
+def get_daily_sales():
+    claims = get_jwt()
+    current_branch_id = claims['branch']
+    
+    if claims.get('role') not in ['admin', 'manager']:
+        return jsonify({"message": "Access Denied."}), 403
+
+    # Accept a date from the URL (e.g., ?date=2026-03-10), otherwise default to today
+    target_date = request.args.get('date', datetime.now().strftime('%Y-%m-%d'))
+
+    cur = mysql.connection.cursor()
+    try:
+        cur.execute("""
+            SELECT 
+                COUNT(sale_id) AS total_transactions,
+                IFNULL(SUM(total_amount), 0) AS gross_revenue,
+                IFNULL(SUM(tax_amount), 0) AS total_vat,
+                IFNULL(SUM(discount_total), 0) AS total_discounts
+            FROM SALES_HEADERS
+            WHERE branch_id = %s AND DATE(sale_date) = %s AND customer_type != 'VOIDED'
+        """, (current_branch_id, target_date))
+        
+        summary = cur.fetchone()
+        total_transactions = summary[0]
+        gross_revenue = float(summary[1])
+        total_vat = float(summary[2])
+        total_discounts = float(summary[3])
+
+        cur.execute("""
+            SELECT 
+                COUNT(return_id) AS total_refund_transactions,
+                IFNULL(SUM(total_refund_amount), 0) AS total_refunded_amount
+            FROM SALES_RETURNS
+            WHERE branch_id = %s AND DATE(return_date) = %s
+        """, (current_branch_id, target_date))
+        
+        refund_summary = cur.fetchone()
+        refund_count = refund_summary[0]
+        total_refunds = float(refund_summary[1])
+
+        net_revenue = gross_revenue - total_refunds
+
+        cur.execute("""
+            SELECT payment_method, IFNULL(SUM(total_amount), 0) 
+            FROM SALES_HEADERS
+            WHERE branch_id = %s AND DATE(sale_date) = %s AND customer_type != 'VOIDED'
+            GROUP BY payment_method
+        """, (current_branch_id, target_date))
+        
+        payment_breakdown = cur.fetchall()
+        
+        payments = {}
+        for row in payment_breakdown:
+            payments[row[0]] = round(float(row[1]), 2)
+
+        report = {
+            "branch_id": current_branch_id,
+            "report_date": target_date,
+            "summary": {
+                "total_transactions": total_transactions,
+                "gross_revenue": round(gross_revenue, 2),
+                "total_refunds_given": round(total_refunds, 2),
+                "net_revenue": round(net_revenue, 2),
+                "total_vat_collected": round(total_vat, 2),
+                "total_discounts_given": round(total_discounts, 2)
+            },
+            "refund_details": {
+                "number_of_refund_transactions": refund_count
+            },
+            "payment_breakdown": payments
+        }
+
+        return jsonify(report), 200
 
     except Exception as e:
         return jsonify({"error": str(e)}), 500
