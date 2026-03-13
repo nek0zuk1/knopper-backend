@@ -447,7 +447,7 @@ def close_shift():
 
     cur = mysql.connection.cursor()
     try:
-        cur.execute("SELECT shift_id, starting_cash FROM CASHIER_SHIFTS WHERE user_id = %s AND status = 'OPEN'", (user_id,))
+        cur.execute("SELECT shift_id, starting_cash, start_time, branch_id FROM CASHIER_SHIFTS WHERE user_id = %s AND status = 'OPEN'", (user_id,))
         shift = cur.fetchone()
         
         if not shift:
@@ -455,16 +455,24 @@ def close_shift():
             
         shift_id = shift[0]
         starting_cash = float(shift[1])
+        start_time = shift[2]
+        branch_id = shift[3]
 
         cur.execute("""
             SELECT IFNULL(SUM(total_amount), 0) 
             FROM SALES_HEADERS 
             WHERE shift_id = %s AND payment_method = 'CASH' AND customer_type != 'VOIDED'
         """, (shift_id,))
-        
         total_cash_sales = float(cur.fetchone()[0])
         
-        expected_cash = starting_cash + total_cash_sales
+        cur.execute("""
+            SELECT IFNULL(SUM(total_refund_amount), 0)
+            FROM SALES_RETURNS
+            WHERE branch_id = %s AND return_date >= %s
+        """, (branch_id, start_time))
+        total_refunds = float(cur.fetchone()[0])
+
+        expected_cash = (starting_cash + total_cash_sales) - total_refunds
         discrepancy = actual_cash - expected_cash
 
         cur.execute("""
@@ -473,10 +481,9 @@ def close_shift():
             WHERE shift_id = %s
         """, (expected_cash, actual_cash, discrepancy, shift_id))
         
-        #  CLEAN UP ABANDONED SUSPENDED TRANSACTIONS ---
-        # Deletes any parked carts that this specific cashier forgot to resume
+        # CLEAN UP ABANDONED SUSPENDED TRANSACTIONS
         cur.execute("DELETE FROM SUSPENDED_TRANSACTIONS WHERE user_id = %s", (user_id,))
-        cleared_carts = cur.rowcount 
+        cleared_carts = cur.rowcount
 
         mysql.connection.commit()
         
@@ -487,10 +494,11 @@ def close_shift():
             "summary": {
                 "starting_cash": starting_cash,
                 "cash_sales": total_cash_sales,
+                "cash_refunds_paid_out": total_refunds, 
                 "expected_cash_in_drawer": expected_cash,
                 "actual_cash_counted": actual_cash,
                 "discrepancy": round(discrepancy, 2),
-                "abandoned_carts_cleared": cleared_carts 
+                "abandoned_carts_cleared": cleared_carts
             }
         }), 200
 
@@ -499,7 +507,7 @@ def close_shift():
         return jsonify({"error": str(e)}), 500
     finally:
         cur.close()
-
+        
 # suspend transaction 
 
 @pos_bp.route('/pos/suspend', methods=['POST'])
@@ -613,4 +621,181 @@ def resume_transaction(suspend_id):
 
 
 # refund/return 
+@pos_bp.route('/pos/refund', methods=['POST'])
+@jwt_required()
+def process_refund():
+    cashier_id = int(get_jwt_identity())
+    
+    data = request.json
+    
+    mgr_username = data.get('manager_username')
+    mgr_password = data.get('manager_password')
 
+    if not mgr_username or not mgr_password:
+        return jsonify({"message": "Manager override credentials are required to process a refund."}), 400
+
+    sale_id = data.get('sale_id')
+    sale_detail_id = data.get('sale_detail_id') 
+    qty_to_return = int(data.get('quantity', 0))
+    reason = data.get('reason')
+    
+    if not all([sale_id, sale_detail_id, qty_to_return, reason]):
+        return jsonify({"message": "Missing sale_id, sale_detail_id, quantity, or reason."}), 400
+
+    cur = mysql.connection.cursor()
+    try:
+        cur.execute("SELECT user_id, password_hash, role, is_active FROM USERS WHERE username = %s", (mgr_username,))
+        manager = cur.fetchone()
+
+        if not manager or not bcrypt.check_password_hash(manager[1], mgr_password):
+            return jsonify({"message": "Override Failed: Invalid Manager Credentials."}), 401
+        
+        if manager[2] not in ['admin', 'manager']:
+            return jsonify({"message": "Override Denied: User is not an admin or manager."}), 403
+            
+        if not manager[3]:
+            return jsonify({"message": "Override Denied: Manager account is currently inactive."}), 403
+            
+        manager_id = manager[0] 
+
+        cur.execute("""
+            SELECT sd.inventory_id, sd.quantity_sold, sd.price_at_sale, sd.discount_applied,
+                   (SELECT IFNULL(SUM(quantity_returned), 0) FROM RETURN_ITEMS WHERE sale_detail_id = %s) as already_refunded
+            FROM SALES_DETAILS sd
+            WHERE sd.sale_detail_id = %s AND sd.sale_id = %s
+        """, (sale_detail_id, sale_detail_id, sale_id))
+        
+        original_item = cur.fetchone()
+
+        if not original_item:
+            return jsonify({"message": f"Verification Failed: This item was not found on Receipt #{sale_id}"}), 404
+        
+        inv_id, qty_sold, price, disc, already_refunded = original_item[0], original_item[1], original_item[2], original_item[3], original_item[4]
+        
+        remaining_refundable = qty_sold - already_refunded
+        
+        if qty_to_return > remaining_refundable:
+            return jsonify({
+                "message": f"Refund Denied: Only {remaining_refundable} units remaining for refund. (Already refunded: {already_refunded})"
+            }), 400
+
+        net_price_per_item = float(price) - (float(disc) / qty_sold if qty_sold > 0 else 0)
+        total_refund_amount = net_price_per_item * qty_to_return
+
+        cur.execute("SELECT branch_id FROM SALES_HEADERS WHERE sale_id = %s", (sale_id,))
+        branch_id = cur.fetchone()[0]
+
+        cur.execute("""
+            INSERT INTO SALES_RETURNS (sale_id, branch_id, user_id, return_date, total_refund_amount, return_reason)
+            VALUES (%s, %s, %s, NOW(), %s, %s)
+        """, (sale_id, branch_id, manager_id, total_refund_amount, reason)) 
+        
+        return_id = cur.lastrowid
+
+        cur.execute("""
+            INSERT INTO RETURN_ITEMS (return_id, sale_detail_id, quantity_returned, refund_amount_per_item, back_to_stock)
+            VALUES (%s, %s, %s, %s, TRUE)
+        """, (return_id, sale_detail_id, qty_to_return, net_price_per_item))
+
+        cur.execute("SELECT product_id FROM BRANCH_INVENTORY WHERE inventory_id = %s", (inv_id,))
+        prod_id = cur.fetchone()[0]
+
+        cur.execute("UPDATE BRANCH_INVENTORY SET quantity_on_hand = quantity_on_hand + %s WHERE inventory_id = %s", (qty_to_return, inv_id))
+        cur.execute("UPDATE PRODUCTS SET total_stock_quantity = total_stock_quantity + %s WHERE product_id = %s", (qty_to_return, prod_id))
+
+        cur.execute("""
+            INSERT INTO STOCK_ADJUSTMENTS (inventory_id, user_id, adjustment_type, quantity_adjusted, date_adjusted, remarks)
+            VALUES (%s, %s, 'RETURN_RESTORE', %s, NOW(), %s)
+        """, (inv_id, manager_id, qty_to_return, f"Refunded Item from Sale #{sale_id}. Authorized by {mgr_username}. Reason: {reason}"))
+
+        mysql.connection.commit()
+        
+        return jsonify({
+            "status": "success",
+            "message": "Refund authorized and recorded.",
+            "authorized_by": mgr_username,
+            "data": {
+                "return_id": return_id,
+                "amount_returned": round(total_refund_amount, 2),
+                "remaining_on_receipt": remaining_refundable - qty_to_return
+            }
+        }), 201
+
+    except Exception as e:
+        mysql.connection.rollback()
+        return jsonify({"error": str(e)}), 500
+    finally:
+        cur.close()
+
+#receive lookup
+
+@pos_bp.route('/pos/transaction-lookup/<int:sale_id>', methods=['GET'])
+@jwt_required()
+def lookup_transaction(sale_id):
+    claims = get_jwt()
+    branch_id = claims['branch']
+
+    cur = mysql.connection.cursor()
+    try:
+        cur.execute("""
+            SELECT sh.sale_date, sh.total_amount, u.username, sh.customer_type, sh.payment_method
+            FROM SALES_HEADERS sh
+            JOIN USERS u ON sh.user_id = u.user_id
+            WHERE sh.sale_id = %s AND sh.branch_id = %s
+        """, (sale_id, branch_id))
+        
+        header = cur.fetchone()
+
+        if not header:
+            return jsonify({"message": f"Receipt #{sale_id} not found in this branch."}), 404
+
+        if header[3] == 'VOIDED':
+            return jsonify({"message": f"Receipt #{sale_id} has been completely VOIDED. No refunds can be processed."}), 400
+
+     
+        cur.execute("""
+            SELECT 
+                sd.sale_detail_id, 
+                p.product_name_official, 
+                sd.quantity_sold, 
+                sd.price_at_sale, 
+                sd.discount_applied,
+                IFNULL((SELECT SUM(quantity_returned) FROM RETURN_ITEMS WHERE sale_detail_id = sd.sale_detail_id), 0) AS already_returned
+            FROM SALES_DETAILS sd
+            JOIN BRANCH_INVENTORY bi ON sd.inventory_id = bi.inventory_id
+            JOIN PRODUCTS p ON bi.product_id = p.product_id
+            WHERE sd.sale_id = %s
+        """, (sale_id,))
+        
+        items = cur.fetchall()
+
+        item_list = []
+        for item in items:
+            detail_id, name, qty_sold, price, discount, returned = item
+            refundable_qty = qty_sold - returned
+
+            item_list.append({
+                "sale_detail_id": detail_id,   
+                "product_name": name,
+                "original_qty_purchased": qty_sold,
+                "qty_already_returned": int(returned),
+                "refundable_qty_remaining": int(refundable_qty),
+                "net_price_paid": float(price) - (float(discount) / qty_sold if qty_sold > 0 else 0)
+            })
+
+        return jsonify({
+            "status": "success",
+            "receipt_info": {
+                "sale_id": sale_id,
+                "date": header[0].strftime('%Y-%m-%d %H:%M:%S'),
+                "total_paid": float(header[1]),
+                "payment_method": header[4],
+                "cashier": header[2]
+            },
+            "line_items": item_list
+        }), 200
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+    finally:
+        cur.close()
