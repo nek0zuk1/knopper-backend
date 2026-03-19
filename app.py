@@ -10,7 +10,10 @@ from inventory import inventory_bp
 from pos import pos_bp
 from procurement import procurement_bp
 from flask_cors import CORS
+from branch import branch_bp
+
 load_dotenv()
+
 
 app = Flask(__name__)
 CORS(app)
@@ -31,6 +34,7 @@ app.register_blueprint(user_bp)
 app.register_blueprint(inventory_bp)
 app.register_blueprint(pos_bp)
 app.register_blueprint(procurement_bp)
+app.register_blueprint(branch_bp)
 
 if __name__ == '__main__':
     app.run(debug=True)

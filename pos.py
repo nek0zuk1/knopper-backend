@@ -3,9 +3,9 @@ from flask_jwt_extended import jwt_required, get_jwt_identity, get_jwt
 from datetime import datetime
 from extensions import mysql
 from extensions import mysql, bcrypt, jwt
-pos_bp = Blueprint('pos', __name__)
-import json
 
+
+pos_bp = Blueprint('pos', __name__)
 
 # POS - PROCESS SALE 
 @pos_bp.route('/pos/checkout', methods=['POST'])
