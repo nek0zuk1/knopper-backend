@@ -3,7 +3,7 @@ from flask_jwt_extended import jwt_required, get_jwt
 from extensions import mysql
 
 # Define the blueprint
-branch_bp = Blueprint('branch', _name_)
+branch_bp = Blueprint('branch',__name__)
 
 # CREATE NEW BRANCH
 @branch_bp.route('/create-branch', methods=['POST'])
