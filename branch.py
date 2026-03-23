@@ -16,7 +16,7 @@ def create_branch():
     claims = get_jwt()
     current_role = claims.get('role')
 
-    # Only admins can create branches
+
     if current_role != 'admin':
         return jsonify({"message": "Access Denied: Only administrators can create new branches."}), 403
 
@@ -25,7 +25,6 @@ def create_branch():
     branch_name = data.get('branch_name')
     branch_code = data.get('branch_code')
 
-    # Validation
     if not all([branch_id, branch_name, branch_code]):
         return jsonify({
             "message": "Validation Error: All fields (branch_id, branch_name, branch_code) are required."
@@ -33,22 +32,22 @@ def create_branch():
 
     cur = mysql.connection.cursor()
     try:
-        # Check for duplicate branch_id
+
         cur.execute("SELECT branch_id FROM BRANCHES WHERE branch_id = %s", (branch_id,))
         if cur.fetchone():
             return jsonify({"message": f"Conflict: Branch ID {branch_id} already exists."}), 409
 
-        # Check for duplicate branch_code
+
         cur.execute("SELECT branch_code FROM BRANCHES WHERE branch_code = %s", (branch_code,))
         if cur.fetchone():
             return jsonify({"message": f"Conflict: Branch code '{branch_code}' is already in use."}), 409
 
-        # Check for duplicate branch_name
+
         cur.execute("SELECT branch_name FROM BRANCHES WHERE branch_name = %s", (branch_name,))
         if cur.fetchone():
             return jsonify({"message": f"Conflict: Branch name '{branch_name}' already exists."}), 409
 
-        # Insert new branch
+
         cur.execute("""
             INSERT INTO BRANCHES (branch_id, branch_name, branch_code)
             VALUES (%s, %s, %s)
@@ -156,7 +155,7 @@ def update_branch(branch_id):
     claims = get_jwt()
     current_role = claims.get('role')
 
-    # Only admins can update branches
+
     if current_role != 'admin':
         return jsonify({"message": "Access Denied: Only administrators can update branch information."}), 403
 
@@ -169,12 +168,12 @@ def update_branch(branch_id):
 
     cur = mysql.connection.cursor()
     try:
-        # Verify branch exists
+
         cur.execute("SELECT * FROM BRANCHES WHERE branch_id = %s", (branch_id,))
         if not cur.fetchone():
             return jsonify({"message": f"Branch ID {branch_id} not found."}), 404
 
-        # Check for duplicate branch_name (excluding current branch)
+
         if branch_name:
             cur.execute("""
                 SELECT branch_id FROM BRANCHES 
@@ -183,7 +182,7 @@ def update_branch(branch_id):
             if cur.fetchone():
                 return jsonify({"message": f"Conflict: Branch name '{branch_name}' is already in use."}), 409
 
-        # Check for duplicate branch_code (excluding current branch)
+
         if branch_code:
             cur.execute("""
                 SELECT branch_id FROM BRANCHES 
@@ -192,7 +191,7 @@ def update_branch(branch_id):
             if cur.fetchone():
                 return jsonify({"message": f"Conflict: Branch code '{branch_code}' is already in use."}), 409
 
-        # Build update query dynamically
+
         update_fields = []
         update_values = []
 
@@ -207,10 +206,9 @@ def update_branch(branch_id):
         if not update_fields:
             return jsonify({"message": "No valid fields provided to update."}), 400
 
-        # Add branch_id to the end of values list
         update_values.append(branch_id)
 
-        # Execute update
+
         sql = f"UPDATE BRANCHES SET {', '.join(update_fields)} WHERE branch_id = %s"
         cur.execute(sql, tuple(update_values))
         mysql.connection.commit()
@@ -244,14 +242,14 @@ def delete_branch(branch_id):
 
     cur = mysql.connection.cursor()
     try:
-        # Check if branch exists
+
         cur.execute("SELECT branch_name FROM BRANCHES WHERE branch_id = %s", (branch_id,))
         branch = cur.fetchone()
         
         if not branch:
             return jsonify({"message": f"Branch ID {branch_id} not found."}), 404
 
-        # Safety check: Check if branch has users
+
         cur.execute("SELECT COUNT(*) FROM USERS WHERE branch_id = %s", (branch_id,))
         user_count = cur.fetchone()[0]
         
@@ -260,7 +258,7 @@ def delete_branch(branch_id):
                 "message": f"Cannot delete branch: {user_count} user(s) are assigned to this branch. Reassign them first."
             }), 409
 
-        # Safety check: Check if branch has inventory
+
         cur.execute("SELECT COUNT(*) FROM BRANCH_INVENTORY WHERE branch_id = %s", (branch_id,))
         inventory_count = cur.fetchone()[0]
         
@@ -269,7 +267,7 @@ def delete_branch(branch_id):
                 "message": f"Cannot delete branch: Branch has {inventory_count} inventory record(s). Clear inventory first."
             }), 409
 
-        # Safety check: Check if branch has gondolas
+
         cur.execute("SELECT COUNT(*) FROM GONDOLAS WHERE branch_id = %s", (branch_id,))
         gondola_count = cur.fetchone()[0]
         
@@ -278,7 +276,6 @@ def delete_branch(branch_id):
                 "message": f"Cannot delete branch: Branch has {gondola_count} gondola(s). Remove them first."
             }), 409
 
-        # If all checks pass, delete the branch
         cur.execute("DELETE FROM BRANCHES WHERE branch_id = %s", (branch_id,))
         mysql.connection.commit()
 

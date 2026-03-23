@@ -6,7 +6,6 @@ from extensions import mysql, bcrypt, jwt
 
 
 pos_bp = Blueprint('pos', __name__)
-
 # POS - PROCESS SALE 
 @pos_bp.route('/pos/checkout', methods=['POST'])
 @jwt_required()
@@ -875,7 +874,6 @@ def get_shift_history():
         cur.close()
 
 #sales report per shift
-
 @pos_bp.route('/pos/shift-report/<int:target_shift_id>', methods=['GET'])
 @jwt_required()
 def get_shift_sales(target_shift_id):

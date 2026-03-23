@@ -30,6 +30,7 @@ mysql.init_app(app)
 bcrypt.init_app(app)
 jwt.init_app(app)
 
+
 app.register_blueprint(user_bp)
 app.register_blueprint(inventory_bp)
 app.register_blueprint(pos_bp)
