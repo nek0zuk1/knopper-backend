@@ -430,19 +430,15 @@ def get_audit_log(branch_id):
 #for testing only
 @inventory_bp.route('/inventory/products', methods=['GET'])
 @jwt_required()
-def get_all_products():
+def get_the_products():
     cur = mysql.connection.cursor()
     try:
-        # 1. Execute the query
-        # Note: You can add 'WHERE total_stock_quantity > 0' if this is for the POS only
         cur.execute("SELECT * FROM PRODUCTS ORDER BY product_name_official ASC")
         
-        # 2. Fetch column names to create a dictionary
         columns = [column[0] for column in cur.description]
         results = []
         
         for row in cur.fetchall():
-            # Creates a dictionary for each row: {"column_name": value}
             results.append(dict(zip(columns, row)))
 
         return jsonify({
